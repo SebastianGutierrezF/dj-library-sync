@@ -16,6 +16,11 @@ use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, WatcherConfig};
 use djls_core::{MatchMethod, SpotifyClient, Verdict};
 
+/// Candidates requested per query. Wider than Spotify's ranking needs for a
+/// clean hit so that an extended mix buried behind a radio edit still shows
+/// up in the results the matcher gets to score.
+const SEARCH_LIMIT: u32 = 20;
+
 #[derive(Parser)]
 #[command(name = "djls", about = "DJ Library Sync — headless matcher and folder watcher")]
 struct Cli {
@@ -199,10 +204,7 @@ async fn cmd_match(
         };
 
         let text_hits = if isrc_hits.is_empty() {
-            client
-                .search_text(&track.primary_artist(), &track.parsed.base, 10)
-                .await
-                .unwrap_or_default()
+            client.search_for_track(&track, SEARCH_LIMIT).await.unwrap_or_default()
         } else {
             Vec::new()
         };

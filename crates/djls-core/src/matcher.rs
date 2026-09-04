@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::normalize::{parse_title, text_similarity, token_set_similarity, MixKind, ParsedTitle};
+use crate::normalize::{normalize, parse_title, text_similarity, token_set_similarity, MixKind, ParsedTitle};
 use crate::spotify::SpotifyTrack;
 use crate::tags::LocalTrack;
 
@@ -97,7 +97,9 @@ pub struct Thresholds {
     pub auto_title: f32,
     pub auto_duration: f32,
     pub review_total: f32,
-    /// If the runner-up is this close, the top match is not safe to auto-push.
+    /// If the runner-up is this close, the top match is not safe to auto-push
+    /// — unless the runner-up turns out to be [`same_recording`] as the top
+    /// pick, in which case there is nothing to review: either one is correct.
     pub ambiguity_margin: f32,
     /// An ISRC hit whose duration differs by more than this is treated as a
     /// mistagged ISRC and sent to review instead of pushed.
@@ -196,6 +198,17 @@ fn mix_score(local: &ParsedTitle, remote: &ParsedTitle, notes: &mut Vec<String>)
     };
 
     Some(score)
+}
+
+/// True when two candidates are almost certainly the same underlying
+/// recording — the same single indexed under two albums, a compilation
+/// re-release, that kind of catalogue duplication — rather than two
+/// different versions genuinely competing for the slot. Same near-enough
+/// duration plus the same name is enough: a real version difference (radio
+/// vs extended, a different remix) always shows up as one or the other.
+fn same_recording(a: &Candidate, b: &Candidate) -> bool {
+    let dur_delta = (a.track.duration_ms as i64 - b.track.duration_ms as i64).abs();
+    dur_delta <= 3_000 && normalize(&a.track.name) == normalize(&b.track.name)
 }
 
 /// Score one candidate against one local file.
@@ -322,9 +335,12 @@ pub fn evaluate(
         MatchMethod::Fuzzy
     };
 
-    let runner_up_close = scored
+    let ambiguous = scored
         .get(1)
-        .map(|c| best.score.total - c.score.total < thresholds.ambiguity_margin)
+        .map(|runner_up| {
+            best.score.total - runner_up.score.total < thresholds.ambiguity_margin
+                && !same_recording(&best, runner_up)
+        })
         .unwrap_or(false);
 
     let clears_auto = best.score.total >= thresholds.auto_total
@@ -332,7 +348,7 @@ pub fn evaluate(
         && best.score.title >= thresholds.auto_title
         && best.score.duration >= thresholds.auto_duration;
 
-    let (verdict, reason) = if clears_auto && runner_up_close {
+    let (verdict, reason) = if clears_auto && ambiguous {
         (
             Verdict::Review,
             "two candidates within the ambiguity margin".to_string(),
@@ -464,6 +480,31 @@ mod tests {
         hit.isrc = Some("DEUM71900123".into());
 
         let out = evaluate(&track, &[hit], &[], Thresholds::default());
+        assert_eq!(out.verdict, Verdict::Review);
+    }
+
+    #[test]
+    fn near_duplicate_listings_auto_push_instead_of_review() {
+        // The same single, indexed once on its own and once on a compilation.
+        // Neither is wrong, so there is nothing to send to review.
+        let track = local("Dennis Cruz", "Get Freaky", 360_000, None);
+        let single = remote("Dennis Cruz", "Get Freaky", 360_000);
+        let mut compilation = remote("Dennis Cruz", "Get Freaky", 360_200);
+        compilation.album = "House Compilation Vol. 4".into();
+
+        let out = evaluate(&track, &[], &[single, compilation], Thresholds::default());
+        assert_eq!(out.verdict, Verdict::Auto);
+    }
+
+    #[test]
+    fn genuinely_different_length_candidates_still_go_to_review_when_close() {
+        // Same title, same artist, but the durations disagree by enough that
+        // these are plausibly two different cuts — the ambiguity is real.
+        let track = local("Dennis Cruz", "Get Freaky", 360_000, None);
+        let a = remote("Dennis Cruz", "Get Freaky", 360_000);
+        let b = remote("Dennis Cruz", "Get Freaky", 365_000);
+
+        let out = evaluate(&track, &[], &[a, b], Thresholds::default());
         assert_eq!(out.verdict, Verdict::Review);
     }
 

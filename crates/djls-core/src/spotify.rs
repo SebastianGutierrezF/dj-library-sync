@@ -14,6 +14,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::tags::LocalTrack;
+
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SEARCH_URL: &str = "https://api.spotify.com/v1/search";
 
@@ -275,6 +277,32 @@ impl SpotifyClient {
                 format!("{artist} {title}")
             };
             let more = self.get_search(&loose, limit).await?;
+            for track in more {
+                if !results.iter().any(|t| t.id == track.id) {
+                    results.push(track);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Every query worth trying for one local track.
+    ///
+    /// A plain "artist title" search often ranks the radio edit or a bare
+    /// re-release above the extended mix, so a long-form local file never
+    /// even sees its own match in the top results. When the local file is
+    /// extended/club-length, run a second query naming the mix explicitly and
+    /// merge in whatever it turns up that the first query missed.
+    pub async fn search_for_track(&self, local: &LocalTrack, limit: u32) -> Result<Vec<SpotifyTrack>> {
+        let artist = local.primary_artist();
+        let title = &local.parsed.base;
+
+        let mut results = self.search_text(&artist, title, limit).await?;
+
+        if local.parsed.kind.is_long_form() {
+            let hinted = format!("{artist} {title} extended mix");
+            let more = self.get_search(&hinted, limit).await.unwrap_or_default();
             for track in more {
                 if !results.iter().any(|t| t.id == track.id) {
                     results.push(track);
