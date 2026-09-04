@@ -18,3 +18,16 @@ notify = "8"
 walkdir = "2"
 base64 = "0.22"
 thiserror = "2"
+sha2 = "0.10"
+getrandom = "0.2"
+
+# The OS credential store differs per platform; pick the native backend for each
+# so tokens never touch a plaintext file.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }

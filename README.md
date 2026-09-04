@@ -69,7 +69,38 @@ cargo run -p djls-cli -- watch ~/Downloads/Beatport
 cargo run -p djls-cli -- parse "Grey (Adam Beyer's Extended Remix)"
 ```
 
+## Connecting your account
+
+Register `http://127.0.0.1:8888/callback` as a redirect URI on your Spotify app
+first — Spotify only validates it *after* you log in, so a missing entry shows
+up as a confusing failure at the end of the flow rather than the start.
+
+```bash
+cargo run -p djls-cli -- login
+```
+
+Opens your browser, and stores the tokens in your OS keychain — never in a file.
+`--no-browser` prints the URL instead, for SSH sessions. Then `djls whoami` to
+confirm, `djls logout` to disconnect.
+
+Note that a development-mode app only works for accounts on its allowlist in the
+developer dashboard.
+
+## Pushing to a playlist
+
+```bash
+cargo run -p djls-cli -- push ~/Downloads/Beatport --dry-run
+cargo run -p djls-cli -- push ~/Downloads/Beatport --playlist "Gym" --accept-shorter
+```
+
+Only `auto` verdicts get pushed — anything needing review waits for you, which
+is the point of the split. The target playlist is created if it doesn't exist
+(default name: `New Downloads <today>`), tracks already in it are skipped so a
+re-run never stacks duplicates, and it asks before writing unless you pass `-y`.
+
 ## The app
+
+
 
 ```bash
 npm run tauri dev
@@ -126,8 +157,9 @@ review queue collapses to one repeated question: accept the shorter cut or not.
 
 ## Not yet built
 
-Phase 1 onward: OAuth (PKCE, `127.0.0.1` loopback — Spotify rejects
-`localhost`), SQLite state, the review screen, playlist push, notifications.
+Phase 2 onward: SQLite state (so a re-run doesn't re-match files it has already
+seen), the review screen, and the push flow wired into the desktop app with a
+completion notification. Auth and playlist push exist only in the CLI so far.
 
 Known API constraint: a development-mode app is capped at `limit=10` on
 search and returns `400 Invalid limit` above it — which fails the whole query,

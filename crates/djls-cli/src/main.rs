@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
 use djls_core::matcher::{evaluate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::normalize::parse_title;
 use djls_core::tags::{scan_folder, LocalTrack};
@@ -77,6 +78,61 @@ enum Command {
     },
     /// Parse a single title string. Handy for checking the mix-descriptor logic.
     Parse { title: String },
+    /// Connect your Spotify account (opens a browser).
+    Login {
+        /// Print the authorization URL instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Forget the stored Spotify tokens.
+    Logout,
+    /// Show which Spotify account is connected.
+    Whoami,
+    /// List the playlists on the connected account.
+    Playlists,
+    /// Match a folder and add the confident matches to a playlist.
+    Push {
+        folder: PathBuf,
+        /// Target playlist by name. Created if it does not exist; defaults to
+        /// "New Downloads <today>".
+        #[arg(long)]
+        playlist: Option<String>,
+        #[arg(long)]
+        no_recursive: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        market: Option<String>,
+        /// Push the shorter version when the extended mix isn't on Spotify.
+        #[arg(long)]
+        accept_shorter: bool,
+        /// Work out what would be added, then stop without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// Tokens live in the OS credential store, never in a file on disk.
+fn token_store() -> Box<dyn TokenStore> {
+    Box::new(KeyringStore::default())
+}
+
+/// PKCE needs only the client ID — there is no secret in this flow.
+fn auth_config() -> Result<AuthConfig> {
+    let client_id = std::env::var("SPOTIFY_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Set SPOTIFY_CLIENT_ID (copy .env.example to .env)")
+        })?;
+    Ok(AuthConfig::new(client_id))
+}
+
+fn user_client(market: Option<String>) -> Result<SpotifyClient> {
+    Ok(SpotifyClient::for_user(auth_config()?, token_store())?.with_market(market))
 }
 
 #[tokio::main]
@@ -115,6 +171,48 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Watch { folder, include_existing } => cmd_watch(&folder, include_existing),
+        Command::Login { no_browser } => cmd_login(no_browser).await,
+        Command::Logout => {
+            token_store().clear()?;
+            println!("Signed out — stored tokens removed.");
+            Ok(())
+        }
+        Command::Whoami => {
+            let me = user_client(None)?.current_user().await?;
+            println!(
+                "{} ({})",
+                me.display_name.as_deref().unwrap_or("(no display name)"),
+                me.id
+            );
+            Ok(())
+        }
+        Command::Playlists => cmd_playlists().await,
+        Command::Push {
+            folder,
+            playlist,
+            no_recursive,
+            limit,
+            market,
+            accept_shorter,
+            dry_run,
+            yes,
+        } => {
+            cmd_push(
+                &folder,
+                playlist,
+                !no_recursive,
+                limit,
+                market,
+                if accept_shorter {
+                    ShorterVersionPolicy::Accept
+                } else {
+                    ShorterVersionPolicy::Review
+                },
+                dry_run,
+                yes,
+            )
+            .await
+        }
         Command::Parse { title } => {
             let p = parse_title(&title);
             println!("raw        {}", p.raw);
@@ -316,6 +414,247 @@ struct Row {
     track: LocalTrack,
     outcome: MatchOutcome,
     search_error: Option<String>,
+}
+
+
+async fn cmd_login(no_browser: bool) -> Result<()> {
+    let config = auth_config()?;
+    let store = token_store();
+
+    println!("Redirect URI: {}", config.redirect_uri());
+    println!(
+        "This exact URI must be listed under \"Redirect URIs\" on your app at\n\
+         https://developer.spotify.com/dashboard — Spotify rejects `localhost`,\n\
+         it has to be the 127.0.0.1 form.\n"
+    );
+
+    auth::login(&config, store.as_ref(), |url| {
+        if !no_browser && auth::open_in_browser(url) {
+            println!("Opened your browser to approve access.");
+        } else {
+            println!("Open this URL to approve access:");
+        }
+        println!("\n{url}\n");
+    })
+    .await?;
+
+    let me = SpotifyClient::for_user(auth_config()?, token_store())?
+        .current_user()
+        .await?;
+    println!(
+        "Signed in as {} ({}). Tokens stored in your OS keychain.",
+        me.display_name.as_deref().unwrap_or("(no display name)"),
+        me.id
+    );
+    Ok(())
+}
+
+async fn cmd_playlists() -> Result<()> {
+    let client = user_client(None)?;
+    let me = client.current_user().await?;
+    let playlists = client.list_playlists().await?;
+
+    if playlists.is_empty() {
+        println!("No playlists on this account yet.");
+        return Ok(());
+    }
+
+    println!("{:<44} {:>7}  {}", "NAME", "TRACKS", "OWNER");
+    println!("{}", "-".repeat(70));
+    for p in &playlists {
+        println!(
+            "{:<44} {:>7}  {}",
+            truncate(&p.name, 43),
+            p.track_count(),
+            if p.is_owned_by(&me.id) { "you" } else { "-" }
+        );
+    }
+    println!("\n{} playlist(s)", playlists.len());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_push(
+    folder: &Path,
+    playlist_name: Option<String>,
+    recursive: bool,
+    limit: Option<usize>,
+    market: Option<String>,
+    shorter_version: ShorterVersionPolicy,
+    dry_run: bool,
+    assume_yes: bool,
+) -> Result<()> {
+    let client = user_client(market)?;
+    let me = client.current_user().await?;
+
+    let mut tracks = load_tracks(folder, recursive)?;
+    if let Some(limit) = limit {
+        tracks.truncate(limit);
+    }
+    if tracks.is_empty() {
+        println!("No audio files found in {}", folder.display());
+        return Ok(());
+    }
+
+    let thresholds = Thresholds {
+        shorter_version,
+        ..Thresholds::default()
+    };
+
+    let total = tracks.len();
+    let mut pushable: Vec<(LocalTrack, MatchOutcome)> = Vec::new();
+    let mut review = 0usize;
+    let mut missing = 0usize;
+    let mut failed = 0usize;
+
+    for (index, track) in tracks.into_iter().enumerate() {
+        eprint!("\rMatching {}/{}...", index + 1, total);
+
+        let isrc_hits = match &track.isrc {
+            Some(isrc) => client.search_isrc(isrc).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let text_hits = if isrc_hits.is_empty() {
+            match client.search_for_track(&track, SEARCH_LIMIT).await {
+                Ok(hits) => hits,
+                Err(_) => {
+                    failed += 1;
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let outcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
+        match outcome.verdict {
+            // Only confident matches are pushed. Everything ambiguous waits for
+            // a human — that separation is the whole point of the verdicts.
+            Verdict::Auto => pushable.push((track, outcome)),
+            Verdict::Review => review += 1,
+            Verdict::NoMatch => missing += 1,
+        }
+    }
+    eprintln!("\r{}", " ".repeat(30));
+
+    if failed > 0 {
+        println!("!! {failed} search(es) failed and were skipped.\n");
+    }
+
+    println!(
+        "{} confident match(es); {review} need review, {missing} not found.",
+        pushable.len()
+    );
+
+    if pushable.is_empty() {
+        println!("Nothing to push.");
+        return Ok(());
+    }
+
+    let name = playlist_name.unwrap_or_else(default_playlist_name);
+    let existing = client
+        .list_playlists()
+        .await?
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(&name) && p.is_owned_by(&me.id));
+
+    // Re-running must not stack duplicates; Spotify will happily add the same
+    // track twice if asked.
+    let already: std::collections::HashSet<String> = match &existing {
+        Some(p) => client.playlist_track_uris(&p.id).await?,
+        None => Default::default(),
+    };
+
+    let mut to_add = Vec::new();
+    let mut skipped = 0usize;
+    for (track, outcome) in &pushable {
+        let Some(best) = outcome.best() else { continue };
+        if already.contains(&best.track.uri) {
+            skipped += 1;
+            continue;
+        }
+        if to_add.iter().any(|(uri, _): &(String, &LocalTrack)| uri == &best.track.uri) {
+            skipped += 1;
+            continue;
+        }
+        to_add.push((best.track.uri.clone(), track));
+    }
+
+    if skipped > 0 {
+        println!("{skipped} already in the playlist — skipping those.");
+    }
+    if to_add.is_empty() {
+        println!("Everything is already in \"{name}\". Nothing to do.");
+        return Ok(());
+    }
+
+    println!(
+        "\nWould add {} track(s) to \"{name}\"{}:",
+        to_add.len(),
+        if existing.is_some() { "" } else { " (new playlist)" }
+    );
+    for (_, track) in to_add.iter().take(10) {
+        println!("  {} - {}", track.artist, track.title);
+    }
+    if to_add.len() > 10 {
+        println!("  ... and {} more", to_add.len() - 10);
+    }
+
+    if dry_run {
+        println!("\nDry run — nothing was written.");
+        return Ok(());
+    }
+
+    if !assume_yes && !confirm("\nAdd these to your Spotify account?")? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let playlist = match existing {
+        Some(p) => p,
+        None => client.create_playlist(&me.id, &name, false).await?,
+    };
+
+    let uris: Vec<String> = to_add.into_iter().map(|(uri, _)| uri).collect();
+    let added = client.add_tracks_to_playlist(&playlist.id, &uris).await?;
+
+    println!("Added {added} track(s) to \"{}\".", playlist.name);
+    Ok(())
+}
+
+fn default_playlist_name() -> String {
+    // Avoids a chrono dependency for one string.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("New Downloads {y:04}-{m:02}-{d:02}")
+}
+
+/// Days since the Unix epoch to a calendar date (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{prompt} [y/N] ");
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn print_track(track: &LocalTrack, outcome: &MatchOutcome) {

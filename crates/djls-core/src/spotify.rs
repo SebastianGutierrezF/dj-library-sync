@@ -6,6 +6,7 @@
 //! not accept `localhost`), and must persist the rotated refresh token on every
 //! refresh.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -14,10 +15,15 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::auth::{self, AuthConfig, TokenStore};
 use crate::tags::LocalTrack;
 
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SEARCH_URL: &str = "https://api.spotify.com/v1/search";
+const API_BASE: &str = "https://api.spotify.com/v1";
+
+/// Playlist additions are one of the few endpoints that *does* batch.
+const MAX_URIS_PER_ADD: usize = 100;
 
 /// Search is one track per request — there is no batch endpoint — so a large
 /// download folder means one call per track. Pace them.
@@ -63,10 +69,24 @@ pub struct RequestStats {
     pub errors: AtomicU64,
 }
 
+/// Where the bearer token comes from.
+///
+/// Search works with either. Anything touching the user's account — their
+/// playlists, their identity — requires `User`.
+enum TokenSource {
+    ClientCredentials {
+        client_id: String,
+        client_secret: String,
+    },
+    User {
+        config: AuthConfig,
+        store: Box<dyn TokenStore>,
+    },
+}
+
 pub struct SpotifyClient {
     http: reqwest::Client,
-    client_id: String,
-    client_secret: String,
+    source: TokenSource,
     market: Option<String>,
     token: Mutex<Option<CachedToken>>,
     last_request: Mutex<Option<Instant>>,
@@ -79,7 +99,7 @@ struct CachedToken {
 }
 
 impl SpotifyClient {
-    pub fn new(client_id: impl Into<String>, client_secret: impl Into<String>) -> Result<Self> {
+    fn build(source: TokenSource) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent("dj-library-sync/0.1")
@@ -88,13 +108,25 @@ impl SpotifyClient {
 
         Ok(Self {
             http,
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            source,
             market: None,
             token: Mutex::new(None),
             last_request: Mutex::new(None),
             stats: RequestStats::default(),
         })
+    }
+
+    /// Search-only client. No user account involved.
+    pub fn new(client_id: impl Into<String>, client_secret: impl Into<String>) -> Result<Self> {
+        Self::build(TokenSource::ClientCredentials {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+        })
+    }
+
+    /// Client acting as the signed-in user, for playlist access.
+    pub fn for_user(config: AuthConfig, store: Box<dyn TokenStore>) -> Result<Self> {
+        Self::build(TokenSource::User { config, store })
     }
 
     /// Restrict results to a market, so the match rate reflects what is
@@ -114,13 +146,61 @@ impl SpotifyClient {
             }
         }
 
+        let (value, ttl) = match &self.source {
+            TokenSource::ClientCredentials {
+                client_id,
+                client_secret,
+            } => self.client_credentials_token(client_id, client_secret).await?,
+
+            TokenSource::User { config, store } => {
+                let stored = store.load()?.ok_or_else(|| {
+                    anyhow!("not signed in to Spotify — run `djls login` first")
+                })?;
+
+                // Refreshing persists any rotated refresh token, which is the
+                // whole reason this goes through the store rather than a
+                // cached copy.
+                let tokens = if stored.is_expired() {
+                    auth::refresh(config, store.as_ref(), &stored).await?
+                } else {
+                    stored
+                };
+
+                let ttl = tokens
+                    .expires_at
+                    .saturating_sub(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    )
+                    .max(1);
+
+                (tokens.access_token, ttl)
+            }
+        };
+
+        let mut cached = self.token.lock().await;
+        *cached = Some(CachedToken {
+            value: value.clone(),
+            expires_at: Instant::now() + Duration::from_secs(ttl),
+        });
+
+        Ok(value)
+    }
+
+    async fn client_credentials_token(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<(String, u64)> {
         #[derive(Deserialize)]
         struct TokenResponse {
             access_token: String,
             expires_in: u64,
         }
 
-        let basic = B64.encode(format!("{}:{}", self.client_id, self.client_secret));
+        let basic = B64.encode(format!("{client_id}:{client_secret}"));
         let resp = self
             .http
             .post(TOKEN_URL)
@@ -139,13 +219,7 @@ impl SpotifyClient {
         let parsed: TokenResponse =
             serde_json::from_str(&body).context("parsing Spotify token response")?;
 
-        let mut cached = self.token.lock().await;
-        *cached = Some(CachedToken {
-            value: parsed.access_token.clone(),
-            expires_at: Instant::now() + Duration::from_secs(parsed.expires_in),
-        });
-
-        Ok(parsed.access_token)
+        Ok((parsed.access_token, parsed.expires_in))
     }
 
     async fn pace(&self) {
@@ -318,6 +392,226 @@ impl SpotifyClient {
         }
 
         Ok(results)
+    }
+}
+
+/// The signed-in user.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpotifyUser {
+    pub id: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub public: Option<bool>,
+    #[serde(default)]
+    pub owner: Option<PlaylistOwner>,
+    #[serde(default)]
+    pub tracks: Option<PlaylistTracksRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaylistOwner {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaylistTracksRef {
+    pub total: u32,
+}
+
+impl Playlist {
+    pub fn track_count(&self) -> u32 {
+        self.tracks.as_ref().map(|t| t.total).unwrap_or(0)
+    }
+
+    pub fn is_owned_by(&self, user_id: &str) -> bool {
+        self.owner.as_ref().map(|o| o.id == user_id).unwrap_or(false)
+    }
+}
+
+#[derive(Deserialize)]
+struct Page<T> {
+    items: Vec<T>,
+    next: Option<String>,
+}
+
+/// User-scoped endpoints. Every one of these needs a `TokenSource::User`
+/// client; with client-credentials the token has no user attached and Spotify
+/// answers 401/403.
+impl SpotifyClient {
+    /// Authenticated request with the same 429/401/5xx handling as search.
+    async fn api_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<String> {
+        let mut attempt = 0u32;
+
+        loop {
+            self.pace().await;
+            let token = self.access_token().await?;
+
+            let mut req = self
+                .http
+                .request(method.clone(), url)
+                .bearer_auth(&token);
+            if let Some(body) = &body {
+                req = req.json(body);
+            }
+
+            self.stats.requests.fetch_add(1, Ordering::Relaxed);
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(err) if attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+                    let _ = err;
+                    continue;
+                }
+                Err(err) => return Err(err).context("Spotify API request failed"),
+            };
+
+            let status = resp.status();
+
+            if status.as_u16() == 429 {
+                self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2);
+                if attempt >= MAX_RETRIES {
+                    bail!("Spotify rate limit persisted after {MAX_RETRIES} retries");
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
+                continue;
+            }
+
+            if status.as_u16() >= 500 && attempt < MAX_RETRIES {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                continue;
+            }
+
+            let text = resp.text().await.context("reading Spotify response body")?;
+            if !status.is_success() {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                if status.as_u16() == 403 {
+                    return Err(anyhow!(
+                        "Spotify refused the request ({status}): {text}\n\
+                         A development-mode app only works for users added to its \
+                         allowlist in the developer dashboard."
+                    ));
+                }
+                return Err(anyhow!("Spotify API error ({status}): {text}"));
+            }
+
+            return Ok(text);
+        }
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let body = self.api_request(reqwest::Method::GET, url, None).await?;
+        serde_json::from_str(&body).with_context(|| format!("parsing response from {url}"))
+    }
+
+    /// Walk a paginated collection to the end.
+    async fn get_all<T: serde::de::DeserializeOwned>(&self, first_url: String) -> Result<Vec<T>> {
+        let mut url = Some(first_url);
+        let mut all = Vec::new();
+
+        while let Some(next) = url {
+            let page: Page<T> = self.get_json(&next).await?;
+            all.extend(page.items);
+            url = page.next;
+        }
+
+        Ok(all)
+    }
+
+    pub async fn current_user(&self) -> Result<SpotifyUser> {
+        self.get_json(&format!("{API_BASE}/me")).await
+    }
+
+    /// Every playlist the user can see, newest first as Spotify returns them.
+    pub async fn list_playlists(&self) -> Result<Vec<Playlist>> {
+        self.get_all(format!("{API_BASE}/me/playlists?limit=50")).await
+    }
+
+    pub async fn create_playlist(
+        &self,
+        user_id: &str,
+        name: &str,
+        public: bool,
+    ) -> Result<Playlist> {
+        let body = serde_json::json!({
+            "name": name,
+            "public": public,
+            "description": "Created by DJ Library Sync",
+        });
+
+        let text = self
+            .api_request(
+                reqwest::Method::POST,
+                &format!("{API_BASE}/users/{user_id}/playlists"),
+                Some(body),
+            )
+            .await?;
+
+        serde_json::from_str(&text).context("parsing created playlist")
+    }
+
+    /// Track URIs already in a playlist, so a re-run does not add duplicates.
+    /// Spotify happily accepts the same track twice — nothing stops it server
+    /// side.
+    pub async fn playlist_track_uris(&self, playlist_id: &str) -> Result<HashSet<String>> {
+        #[derive(Deserialize)]
+        struct Item {
+            track: Option<TrackRef>,
+        }
+        #[derive(Deserialize)]
+        struct TrackRef {
+            uri: Option<String>,
+        }
+
+        let items: Vec<Item> = self
+            .get_all(format!(
+                "{API_BASE}/playlists/{playlist_id}/tracks?limit=100&fields=items(track(uri)),next"
+            ))
+            .await?;
+
+        Ok(items
+            .into_iter()
+            .filter_map(|i| i.track.and_then(|t| t.uri))
+            .collect())
+    }
+
+    /// Add tracks, 100 per request. Returns how many were sent.
+    pub async fn add_tracks_to_playlist(&self, playlist_id: &str, uris: &[String]) -> Result<usize> {
+        if uris.is_empty() {
+            return Ok(0);
+        }
+
+        for chunk in uris.chunks(MAX_URIS_PER_ADD) {
+            let body = serde_json::json!({ "uris": chunk });
+            self.api_request(
+                reqwest::Method::POST,
+                &format!("{API_BASE}/playlists/{playlist_id}/tracks"),
+                Some(body),
+            )
+            .await?;
+        }
+
+        Ok(uris.len())
     }
 }
 
