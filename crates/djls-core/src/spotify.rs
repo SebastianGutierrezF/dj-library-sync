@@ -425,8 +425,10 @@ pub struct PlaylistTracksRef {
 }
 
 impl Playlist {
-    pub fn track_count(&self) -> u32 {
-        self.tracks.as_ref().map(|t| t.total).unwrap_or(0)
+    /// `None` when Spotify omits the `tracks` object, which it does on
+    /// `/me/playlists`. Reporting that as 0 misleads.
+    pub fn track_count(&self) -> Option<u32> {
+        self.tracks.as_ref().map(|t| t.total)
     }
 
     pub fn is_owned_by(&self, user_id: &str) -> bool {
@@ -506,11 +508,18 @@ impl SpotifyClient {
             if !status.is_success() {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 if status.as_u16() == 403 {
-                    return Err(anyhow!(
-                        "Spotify refused the request ({status}): {text}\n\
-                         A development-mode app only works for users added to its \
-                         allowlist in the developer dashboard."
-                    ));
+                    // Spotify distinguishes these two, and they need opposite
+                    // fixes — conflating them sends you to the wrong place.
+                    let hint = if text.contains("Insufficient client scope") {
+                        "The token is missing a required scope. Run `djls logout` \
+                         then `djls login` to re-consent."
+                    } else {
+                        "Scopes look fine, so this is an app-level permission. \
+                         Check the app in the Spotify developer dashboard: your \
+                         account must be listed under Settings -> User Management \
+                         while the app is in development mode."
+                    };
+                    return Err(anyhow!("Spotify refused the request ({status}): {text}\n{hint}"));
                 }
                 return Err(anyhow!("Spotify API error ({status}): {text}"));
             }

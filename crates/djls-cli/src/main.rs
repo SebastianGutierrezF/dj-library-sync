@@ -465,7 +465,9 @@ async fn cmd_playlists() -> Result<()> {
         println!(
             "{:<44} {:>7}  {}",
             truncate(&p.name, 43),
-            p.track_count(),
+            p.track_count()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             if p.is_owned_by(&me.id) { "you" } else { "-" }
         );
     }
