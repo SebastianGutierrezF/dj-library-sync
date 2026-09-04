@@ -88,6 +88,22 @@ impl MatchOutcome {
     }
 }
 
+/// What to do when the platform carries the right song but only a shorter cut
+/// of it — the extended mix the DJ bought simply isn't published.
+///
+/// This is the single most common outcome for a real download folder, so it is
+/// a policy rather than a threshold: the answer is a user preference, not a
+/// tuning constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShorterVersionPolicy {
+    /// Park it and let the user decide. Safe default.
+    Review,
+    /// Push the shorter cut — having the song on the phone beats not having it.
+    Accept,
+    /// Only the real cut will do; treat a shortened version as no match.
+    Reject,
+}
+
 /// Thresholds, kept in one place so they can be tuned against a real library
 /// rather than guessed at.
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +120,12 @@ pub struct Thresholds {
     /// An ISRC hit whose duration differs by more than this is treated as a
     /// mistagged ISRC and sent to review instead of pushed.
     pub isrc_duration_sanity_ms: i64,
+    /// How much shorter the candidate must be before it counts as a different
+    /// *cut* rather than a different master. Below this, a length disagreement
+    /// is just mastering variance and the normal duration score handles it.
+    pub shorter_cut_min_delta_ms: i64,
+    /// What to do once a shorter cut is identified.
+    pub shorter_version: ShorterVersionPolicy,
 }
 
 impl Default for Thresholds {
@@ -116,6 +138,8 @@ impl Default for Thresholds {
             review_total: 0.62,
             ambiguity_margin: 0.05,
             isrc_duration_sanity_ms: 30_000,
+            shorter_cut_min_delta_ms: 20_000,
+            shorter_version: ShorterVersionPolicy::Review,
         }
     }
 }
@@ -209,6 +233,21 @@ fn mix_score(local: &ParsedTitle, remote: &ParsedTitle, notes: &mut Vec<String>)
 fn same_recording(a: &Candidate, b: &Candidate) -> bool {
     let dur_delta = (a.track.duration_ms as i64 - b.track.duration_ms as i64).abs();
     dur_delta <= 3_000 && normalize(&a.track.name) == normalize(&b.track.name)
+}
+
+/// True when the candidate is confidently the same song but a materially
+/// shorter cut of it — the radio edit standing in for an extended mix that was
+/// never published. Artist and title must both be strong: this only reframes a
+/// length disagreement, it never rescues a doubtful identity.
+fn is_shorter_cut_of_same_song(candidate: &Candidate, thresholds: &Thresholds) -> bool {
+    // `duration_delta_ms` is local minus remote, so positive means the local
+    // file is the longer one.
+    candidate.score.duration_delta_ms >= thresholds.shorter_cut_min_delta_ms
+        && candidate.score.artist >= thresholds.auto_artist
+        && candidate.score.title >= thresholds.auto_title
+        // A hard reject (different remixer) zeroes the mix score; never
+        // reinterpret one of those as a length problem.
+        && candidate.score.mix > 0.0
 }
 
 /// Score one candidate against one local file.
@@ -348,6 +387,8 @@ pub fn evaluate(
         && best.score.title >= thresholds.auto_title
         && best.score.duration >= thresholds.auto_duration;
 
+    let shorter_cut = !clears_auto && is_shorter_cut_of_same_song(&best, &thresholds);
+
     let (verdict, reason) = if clears_auto && ambiguous {
         (
             Verdict::Review,
@@ -355,6 +396,22 @@ pub fn evaluate(
         )
     } else if clears_auto {
         (Verdict::Auto, format!("{} match", method.as_str()))
+    } else if shorter_cut {
+        let short_by = best.score.duration_delta_ms / 1000;
+        match thresholds.shorter_version {
+            ShorterVersionPolicy::Accept => (
+                Verdict::Auto,
+                format!("shorter cut accepted ({short_by}s shorter)"),
+            ),
+            ShorterVersionPolicy::Reject => (
+                Verdict::NoMatch,
+                format!("only a shorter cut available ({short_by}s shorter)"),
+            ),
+            ShorterVersionPolicy::Review => (
+                Verdict::Review,
+                format!("only a shorter cut available ({short_by}s shorter)"),
+            ),
+        }
     } else if best.score.total >= thresholds.review_total {
         (
             Verdict::Review,
@@ -506,6 +563,99 @@ mod tests {
 
         let out = evaluate(&track, &[], &[a, b], Thresholds::default());
         assert_eq!(out.verdict, Verdict::Review);
+    }
+
+    /// The dominant real-world case: the DJ bought a 6:40 extended mix and
+    /// Spotify only publishes the 3:20 radio cut of the same song.
+    fn extended_local_with_only_a_radio_cut_available() -> (LocalTrack, SpotifyTrack) {
+        (
+            local("DONT BLINK", "OUT OF MY HEAD (Extended Mix)", 400_000, None),
+            remote("DONT BLINK", "OUT OF MY HEAD", 199_000),
+        )
+    }
+
+    #[test]
+    fn shorter_cut_defaults_to_review() {
+        let (track, short) = extended_local_with_only_a_radio_cut_available();
+        let out = evaluate(&track, &[], &[short], Thresholds::default());
+
+        assert_eq!(out.verdict, Verdict::Review);
+        assert!(out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+    }
+
+    #[test]
+    fn shorter_cut_is_pushed_when_the_policy_accepts_it() {
+        let (track, short) = extended_local_with_only_a_radio_cut_available();
+        let thresholds = Thresholds {
+            shorter_version: ShorterVersionPolicy::Accept,
+            ..Thresholds::default()
+        };
+
+        let out = evaluate(&track, &[], &[short], thresholds);
+        assert_eq!(out.verdict, Verdict::Auto);
+        assert!(out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+    }
+
+    #[test]
+    fn shorter_cut_is_dropped_when_the_policy_rejects_it() {
+        let (track, short) = extended_local_with_only_a_radio_cut_available();
+        let thresholds = Thresholds {
+            shorter_version: ShorterVersionPolicy::Reject,
+            ..Thresholds::default()
+        };
+
+        assert_eq!(
+            evaluate(&track, &[], &[short], thresholds).verdict,
+            Verdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn accepting_shorter_cuts_never_rescues_the_wrong_song() {
+        // Same length relationship, but a different song entirely. The policy
+        // must not turn a bad identity match into an auto-push.
+        let track = local("Kolsch", "Grey (Extended Mix)", 400_000, None);
+        let wrong = remote("Taylor Swift", "Blank Space", 199_000);
+        let thresholds = Thresholds {
+            shorter_version: ShorterVersionPolicy::Accept,
+            ..Thresholds::default()
+        };
+
+        assert_eq!(
+            evaluate(&track, &[], &[wrong], thresholds).verdict,
+            Verdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn accepting_shorter_cuts_never_overrides_a_different_remixer() {
+        let track = local("Kolsch", "Grey (Adam Beyer Remix)", 400_000, None);
+        let other = remote("Kolsch", "Grey (Charlotte de Witte Remix)", 199_000);
+        let thresholds = Thresholds {
+            shorter_version: ShorterVersionPolicy::Accept,
+            ..Thresholds::default()
+        };
+
+        assert_eq!(
+            evaluate(&track, &[], &[other], thresholds).verdict,
+            Verdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn small_length_differences_are_mastering_not_a_shorter_cut() {
+        // 8s apart: same cut, different master. Must not be reframed as a
+        // shorter-version decision.
+        let track = local("Kolsch", "Grey (Extended Mix)", 400_000, None);
+        let variant = remote("Kolsch", "Grey - Extended Mix", 392_000);
+        let thresholds = Thresholds {
+            shorter_version: ShorterVersionPolicy::Accept,
+            ..Thresholds::default()
+        };
+
+        let out = evaluate(&track, &[], &[variant], thresholds);
+        assert_eq!(out.verdict, Verdict::Review);
+        assert!(!out.reason.contains("shorter cut"), "reason was: {}", out.reason);
     }
 
     #[test]

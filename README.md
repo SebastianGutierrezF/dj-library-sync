@@ -60,8 +60,9 @@ secret from https://developer.spotify.com/dashboard. This command uses the
 Client Credentials flow, so no redirect URI and no user account are involved.
 
 Useful flags: `--limit 100` for a fast read on a huge folder, `--market GB` to
-count only what is actually available in your country, `--verbose` for
-per-track output.
+count only what is actually available in your country, `--accept-shorter` /
+`--reject-shorter` to set the shorter-cut policy, `--verbose` for per-track
+output.
 
 ```bash
 cargo run -p djls-cli -- watch ~/Downloads/Beatport
@@ -98,6 +99,30 @@ different remixer is a hard reject regardless of string similarity.
 
 Verdicts are `auto` (push it), `review` (park it — never block the batch), and
 `no_match` (the future AcoustID queue).
+
+**Shorter cuts.** The most common real outcome is that Spotify has the right
+song but only a shorter cut of it — the extended mix was never published.
+`ShorterVersionPolicy` decides what happens then: `Review` (default), `Accept`
+(push the shorter version), or `Reject` (treat as no match). It only applies
+when artist and title both score above the auto thresholds and the candidate is
+at least 20s shorter, so it reframes a length disagreement and never rescues a
+doubtful identity.
+
+## Measured on a real library
+
+27 tracks from a Beatport downloads folder, 0 search errors:
+
+| | default | `--accept-shorter` |
+|---|---|---|
+| auto-push | 15 (56%) | 23 (85%) |
+| needs review | 11 (41%) | 3 (11%) |
+| no match | 1 (4%) | 1 (4%) |
+
+96% of the library exists on Spotify, but only 67% of matches agree on length
+within 5s. Of 6 local extended mixes, only 2 had their extended cut published;
+the other 4 were verified by hand to be genuinely absent, not a search failure.
+So availability is not the constraint — version fidelity is, and the whole
+review queue collapses to one repeated question: accept the shorter cut or not.
 
 ## Not yet built
 

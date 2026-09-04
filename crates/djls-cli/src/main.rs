@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use djls_core::matcher::{evaluate, MatchOutcome, Thresholds};
+use djls_core::matcher::{evaluate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::normalize::parse_title;
 use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, WatcherConfig};
@@ -57,6 +57,13 @@ enum Command {
         /// Write a per-track CSV report here.
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Push the shorter version when the extended mix isn't on Spotify,
+        /// instead of parking it for review.
+        #[arg(long, conflicts_with = "reject_shorter")]
+        accept_shorter: bool,
+        /// Treat a song that is only available as a shorter cut as no match.
+        #[arg(long)]
+        reject_shorter: bool,
         /// Print every track as it is processed.
         #[arg(long)]
         verbose: bool,
@@ -85,8 +92,28 @@ async fn main() -> Result<()> {
             limit,
             market,
             csv,
+            accept_shorter,
+            reject_shorter,
             verbose,
-        } => cmd_match(&folder, !no_recursive, limit, market, csv, verbose).await,
+        } => {
+            let shorter_version = if accept_shorter {
+                ShorterVersionPolicy::Accept
+            } else if reject_shorter {
+                ShorterVersionPolicy::Reject
+            } else {
+                ShorterVersionPolicy::Review
+            };
+            cmd_match(
+                &folder,
+                !no_recursive,
+                limit,
+                market,
+                csv,
+                shorter_version,
+                verbose,
+            )
+            .await
+        }
         Command::Watch { folder, include_existing } => cmd_watch(&folder, include_existing),
         Command::Parse { title } => {
             let p = parse_title(&title);
@@ -173,6 +200,7 @@ async fn cmd_match(
     limit: Option<usize>,
     market: Option<String>,
     csv_path: Option<PathBuf>,
+    shorter_version: ShorterVersionPolicy,
     verbose: bool,
 ) -> Result<()> {
     let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok().filter(|s| !s.is_empty());
@@ -197,7 +225,10 @@ async fn cmd_match(
         return Ok(());
     }
 
-    let thresholds = Thresholds::default();
+    let thresholds = Thresholds {
+        shorter_version,
+        ..Thresholds::default()
+    };
     let total = tracks.len();
     let mut rows: Vec<Row> = Vec::with_capacity(total);
     let mut failed = 0usize;
@@ -416,6 +447,11 @@ fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
         "delta_seconds",
         "spotify_url",
         "spotify_uri",
+        "score_artist",
+        "score_title",
+        "score_duration",
+        "score_mix",
+        "runner_up",
         "search_error",
         "notes",
     ])?;
@@ -444,6 +480,23 @@ fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
                 .unwrap_or_default(),
             best.and_then(|c| c.track.url.clone()).unwrap_or_default(),
             best.map(|c| c.track.uri.clone()).unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.artist)).unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.title)).unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.duration)).unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.mix)).unwrap_or_default(),
+            outcome
+                .candidates
+                .get(1)
+                .map(|c| {
+                    format!(
+                        "{} - {} [{}] ({:.0}%)",
+                        c.track.artist_field(),
+                        c.track.name,
+                        c.track.duration_display(),
+                        c.score.total * 100.0
+                    )
+                })
+                .unwrap_or_default(),
             search_error.clone().unwrap_or_default(),
             best.map(|c| c.score.notes.join("; "))
                 .filter(|n| !n.is_empty())

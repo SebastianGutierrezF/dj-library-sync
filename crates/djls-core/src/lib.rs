@@ -10,7 +10,7 @@ pub mod spotify;
 pub mod tags;
 pub mod watcher;
 
-pub use matcher::{Candidate, MatchMethod, Score, Verdict};
+pub use matcher::{Candidate, MatchMethod, Score, ShorterVersionPolicy, Verdict};
 pub use normalize::{MixKind, ParsedTitle};
 pub use spotify::{SpotifyClient, SpotifyTrack};
 pub use tags::LocalTrack;
