@@ -16,10 +16,16 @@ use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, WatcherConfig};
 use djls_core::{MatchMethod, SpotifyClient, Verdict};
 
-/// Candidates requested per query. Wider than Spotify's ranking needs for a
-/// clean hit so that an extended mix buried behind a radio edit still shows
-/// up in the results the matcher gets to score.
-const SEARCH_LIMIT: u32 = 20;
+/// Candidates requested per query. Spotify caps this at 10 for a development
+/// -mode app, so the candidate pool is widened with extra queries instead —
+/// see `SpotifyClient::search_for_track`.
+const SEARCH_LIMIT: u32 = 10;
+
+/// Stop once it is clear the API is failing systemically rather than a query
+/// here and there. A report built on failed searches understates the match
+/// rate instead of reporting an error, which is worse than no report at all.
+const MIN_ATTEMPTS_BEFORE_ABORT: usize = 5;
+const ABORT_ERROR_RATE: f64 = 0.5;
 
 #[derive(Parser)]
 #[command(name = "djls", about = "DJ Library Sync — headless matcher and folder watcher")]
@@ -193,21 +199,43 @@ async fn cmd_match(
 
     let thresholds = Thresholds::default();
     let total = tracks.len();
-    let mut rows: Vec<(LocalTrack, MatchOutcome)> = Vec::with_capacity(total);
+    let mut rows: Vec<Row> = Vec::with_capacity(total);
+    let mut failed = 0usize;
 
     for (index, track) in tracks.into_iter().enumerate() {
         eprint!("\rMatching {}/{}...", index + 1, total);
 
+        // A failed search is not the same thing as a track that isn't on
+        // Spotify. Keep the distinction — conflating them turns an outage
+        // into a confidently wrong match rate.
+        let mut search_error = None;
+
         let isrc_hits = match &track.isrc {
-            Some(isrc) => client.search_isrc(isrc).await.unwrap_or_default(),
+            Some(isrc) => match client.search_isrc(isrc).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
 
         let text_hits = if isrc_hits.is_empty() {
-            client.search_for_track(&track, SEARCH_LIMIT).await.unwrap_or_default()
+            match client.search_for_track(&track, SEARCH_LIMIT).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
+
+        if search_error.is_some() {
+            failed += 1;
+        }
 
         let outcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
 
@@ -216,7 +244,26 @@ async fn cmd_match(
             print_track(&track, &outcome);
         }
 
-        rows.push((track, outcome));
+        let attempts = index + 1;
+        if attempts >= MIN_ATTEMPTS_BEFORE_ABORT
+            && (failed as f64 / attempts as f64) >= ABORT_ERROR_RATE
+        {
+            eprintln!("\r{}", " ".repeat(30));
+            bail!(
+                "Aborting: {failed} of the first {attempts} searches failed, so any match rate \
+                 from this run would be meaningless.\n\nLast error: {}",
+                search_error
+                    .as_deref()
+                    .or(rows.iter().rev().find_map(|r| r.search_error.as_deref()))
+                    .unwrap_or("unknown")
+            );
+        }
+
+        rows.push(Row {
+            track,
+            outcome,
+            search_error,
+        });
     }
     eprintln!("\r{}", " ".repeat(30));
 
@@ -230,6 +277,14 @@ async fn cmd_match(
     }
 
     Ok(())
+}
+
+/// One track's result. `search_error` is kept separate from the verdict so a
+/// failed lookup is never counted as "not on Spotify".
+struct Row {
+    track: LocalTrack,
+    outcome: MatchOutcome,
+    search_error: Option<String>,
 }
 
 fn print_track(track: &LocalTrack, outcome: &MatchOutcome) {
@@ -260,32 +315,53 @@ fn print_track(track: &LocalTrack, outcome: &MatchOutcome) {
     }
 }
 
-fn print_summary(rows: &[(LocalTrack, MatchOutcome)], client: &SpotifyClient) {
-    let total = rows.len();
+fn print_summary(rows: &[Row], client: &SpotifyClient) {
     let mut by_verdict: BTreeMap<&str, usize> = BTreeMap::new();
     let mut by_method: BTreeMap<&str, usize> = BTreeMap::new();
     let mut miss_reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut search_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut isrc_tagged = 0usize;
     let mut isrc_resolved = 0usize;
 
-    for (track, outcome) in rows {
-        *by_verdict.entry(outcome.verdict.as_str()).or_default() += 1;
-        *by_method.entry(outcome.method.as_str()).or_default() += 1;
+    for row in rows {
+        // Rows whose search failed say nothing about availability, so they are
+        // reported on their own rather than folded into the rate.
+        if let Some(err) = &row.search_error {
+            *search_errors.entry(err.clone()).or_default() += 1;
+            continue;
+        }
 
-        if track.isrc.is_some() {
+        *by_verdict.entry(row.outcome.verdict.as_str()).or_default() += 1;
+        *by_method.entry(row.outcome.method.as_str()).or_default() += 1;
+
+        if row.track.isrc.is_some() {
             isrc_tagged += 1;
-            if outcome.method == MatchMethod::Isrc {
+            if row.outcome.method == MatchMethod::Isrc {
                 isrc_resolved += 1;
             }
         }
-        if outcome.verdict == Verdict::NoMatch {
-            *miss_reasons.entry(outcome.reason.clone()).or_default() += 1;
+        if row.outcome.verdict == Verdict::NoMatch {
+            *miss_reasons.entry(row.outcome.reason.clone()).or_default() += 1;
         }
     }
+
+    let failed: usize = search_errors.values().sum();
+    let total = rows.len() - failed;
 
     let auto = *by_verdict.get("auto").unwrap_or(&0);
     let review = *by_verdict.get("review").unwrap_or(&0);
     let miss = *by_verdict.get("no_match").unwrap_or(&0);
+
+    if failed > 0 {
+        println!(
+            "\n!! {failed} of {} track(s) could not be searched — they are excluded below,\n\
+             !! so this rate covers only the {total} track(s) that got a real answer.",
+            rows.len()
+        );
+        for (err, count) in &search_errors {
+            println!("   {count:>4}  {}", truncate(err, 68));
+        }
+    }
 
     println!("\n=== Match rate over {total} track(s) ===\n");
     println!("  auto-push      {auto:>4}   {:>5.1}%", pct(auto, total));
@@ -322,7 +398,7 @@ fn print_summary(rows: &[(LocalTrack, MatchOutcome)], client: &SpotifyClient) {
     );
 }
 
-fn write_csv(path: &Path, rows: &[(LocalTrack, MatchOutcome)]) -> Result<()> {
+fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
     let mut writer = csv::Writer::from_path(path)?;
     writer.write_record([
         "file",
@@ -340,10 +416,16 @@ fn write_csv(path: &Path, rows: &[(LocalTrack, MatchOutcome)]) -> Result<()> {
         "delta_seconds",
         "spotify_url",
         "spotify_uri",
+        "search_error",
         "notes",
     ])?;
 
-    for (track, outcome) in rows {
+    for Row {
+        track,
+        outcome,
+        search_error,
+    } in rows
+    {
         let best = outcome.best();
         writer.write_record([
             track.file_name.clone(),
@@ -362,6 +444,7 @@ fn write_csv(path: &Path, rows: &[(LocalTrack, MatchOutcome)]) -> Result<()> {
                 .unwrap_or_default(),
             best.and_then(|c| c.track.url.clone()).unwrap_or_default(),
             best.map(|c| c.track.uri.clone()).unwrap_or_default(),
+            search_error.clone().unwrap_or_default(),
             best.map(|c| c.score.notes.join("; "))
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| outcome.reason.clone()),

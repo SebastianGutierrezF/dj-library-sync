@@ -104,6 +104,11 @@ Verdicts are `auto` (push it), `review` (park it — never block the batch), and
 Phase 1 onward: OAuth (PKCE, `127.0.0.1` loopback — Spotify rejects
 `localhost`), SQLite state, the review screen, playlist push, notifications.
 
+Known API constraint: a development-mode app is capped at `limit=10` on
+search and returns `400 Invalid limit` above it — which fails the whole query,
+not just the excess. The client clamps to 10; widen the candidate pool with
+extra queries (or `offset` paging, which is not restricted) instead.
+
 Two things to settle before Phase 1:
 
 - **Spotify app quota.** New apps are limited to a small allowlist of users.

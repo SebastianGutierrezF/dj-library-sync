@@ -24,6 +24,13 @@ const SEARCH_URL: &str = "https://api.spotify.com/v1/search";
 const MIN_REQUEST_GAP: Duration = Duration::from_millis(120);
 const MAX_RETRIES: u32 = 4;
 
+/// Spotify documents `limit` as 1-50, but an app in development mode is capped
+/// at 10 and returns a blanket `400 Invalid limit` above it — which fails every
+/// search, not just the oversized one. Clamp rather than trust the docs.
+/// Widen the candidate pool with extra *queries* instead; `offset` paging is
+/// available too if a single query ever needs to go deeper than 10.
+const MAX_SEARCH_LIMIT: u32 = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyTrack {
     pub id: String,
@@ -164,7 +171,7 @@ impl SpotifyClient {
             let mut params: Vec<(&str, String)> = vec![
                 ("q", query.to_string()),
                 ("type", "track".to_string()),
-                ("limit", limit.to_string()),
+                ("limit", limit.clamp(1, MAX_SEARCH_LIMIT).to_string()),
             ];
             if let Some(market) = &self.market {
                 params.push(("market", market.clone()));
