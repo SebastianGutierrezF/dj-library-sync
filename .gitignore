@@ -1,0 +1,9 @@
+/target
+node_modules
+dist
+.env
+*.csv
+.DS_Store
+/src-tauri/gen
+/src-tauri/target
+.env.local
