@@ -18,3 +18,4 @@ tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 dotenvy = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
