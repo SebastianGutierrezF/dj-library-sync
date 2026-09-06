@@ -614,7 +614,7 @@ async fn cmd_push(
 
     let playlist = match existing {
         Some(p) => p,
-        None => client.create_playlist(&me.id, &name, false).await?,
+        None => client.create_playlist(&name, false).await?,
     };
 
     let uris: Vec<String> = to_add.into_iter().map(|(uri, _)| uri).collect();

@@ -161,10 +161,29 @@ Phase 2 onward: SQLite state (so a re-run doesn't re-match files it has already
 seen), the review screen, and the push flow wired into the desktop app with a
 completion notification. Auth and playlist push exist only in the CLI so far.
 
-Known API constraint: a development-mode app is capped at `limit=10` on
-search and returns `400 Invalid limit` above it — which fails the whole query,
-not just the excess. The client clamps to 10; widen the candidate pool with
-extra queries (or `offset` paging, which is not restricted) instead.
+## Development Mode constraints (February 2026 changes)
+
+Spotify [reduced Development Mode](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security)
+in February 2026, and this app is built against the reduced surface. The
+[migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
+is the authoritative list; what bites this project:
+
+| Removed / changed | Used here as |
+|---|---|
+| `POST /users/{id}/playlists` removed | `POST /me/playlists` |
+| `POST /playlists/{id}/tracks` | `POST /playlists/{id}/items` |
+| `GET /playlists/{id}/tracks` | `GET /playlists/{id}/items` |
+| playlist `tracks` field renamed | `items` (entries carry `item`, not `track`) |
+| search `limit` max 50 → **10** | clamped in the client; widen with extra queries |
+| `GET /me` drops `country`, `product` | not relied on |
+| track `popularity` dropped | optional, unused for scoring |
+
+Calling a removed endpoint returns a bare `403 Forbidden` — not a scope error,
+and not something a dashboard setting can fix. `"Insufficient client scope"` is
+the genuinely scope-related 403; the two need opposite fixes.
+
+Also required in Development Mode: the app owner must have **Spotify Premium**,
+and each user must be listed under Settings → User Management (max 5).
 
 Two things to settle before Phase 1:
 

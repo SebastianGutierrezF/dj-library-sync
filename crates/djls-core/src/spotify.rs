@@ -30,11 +30,10 @@ const MAX_URIS_PER_ADD: usize = 100;
 const MIN_REQUEST_GAP: Duration = Duration::from_millis(120);
 const MAX_RETRIES: u32 = 4;
 
-/// Spotify documents `limit` as 1-50, but an app in development mode is capped
-/// at 10 and returns a blanket `400 Invalid limit` above it — which fails every
-/// search, not just the oversized one. Clamp rather than trust the docs.
-/// Widen the candidate pool with extra *queries* instead; `offset` paging is
-/// available too if a single query ever needs to go deeper than 10.
+/// The February 2026 dev-mode changes cut search `limit` from a maximum of 50
+/// to 10 (default 5). Anything above 10 fails the whole query with
+/// `400 Invalid limit`, so clamp instead of trusting the older docs. Widen the
+/// candidate pool with extra *queries*; `offset` paging is still available.
 const MAX_SEARCH_LIMIT: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -410,8 +409,10 @@ pub struct Playlist {
     pub public: Option<bool>,
     #[serde(default)]
     pub owner: Option<PlaylistOwner>,
-    #[serde(default)]
-    pub tracks: Option<PlaylistTracksRef>,
+    /// Renamed from `tracks` in the February 2026 Web API changes. The alias
+    /// keeps extended-quota apps, which still send `tracks`, working.
+    #[serde(default, alias = "tracks")]
+    pub items: Option<PlaylistItemsRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,15 +421,15 @@ pub struct PlaylistOwner {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PlaylistTracksRef {
+pub struct PlaylistItemsRef {
     pub total: u32,
 }
 
 impl Playlist {
-    /// `None` when Spotify omits the `tracks` object, which it does on
-    /// `/me/playlists`. Reporting that as 0 misleads.
+    /// `None` when Spotify omits the count, which it does for playlists the
+    /// user neither owns nor collaborates on. Reporting that as 0 misleads.
     pub fn track_count(&self) -> Option<u32> {
-        self.tracks.as_ref().map(|t| t.total)
+        self.items.as_ref().map(|t| t.total)
     }
 
     pub fn is_owned_by(&self, user_id: &str) -> bool {
@@ -556,12 +557,9 @@ impl SpotifyClient {
         self.get_all(format!("{API_BASE}/me/playlists?limit=50")).await
     }
 
-    pub async fn create_playlist(
-        &self,
-        user_id: &str,
-        name: &str,
-        public: bool,
-    ) -> Result<Playlist> {
+    /// `POST /users/{id}/playlists` was removed in February 2026 — creation is
+    /// `POST /me/playlists`, which always targets the signed-in user.
+    pub async fn create_playlist(&self, name: &str, public: bool) -> Result<Playlist> {
         let body = serde_json::json!({
             "name": name,
             "public": public,
@@ -571,7 +569,7 @@ impl SpotifyClient {
         let text = self
             .api_request(
                 reqwest::Method::POST,
-                &format!("{API_BASE}/users/{user_id}/playlists"),
+                &format!("{API_BASE}/me/playlists"),
                 Some(body),
             )
             .await?;
@@ -584,23 +582,26 @@ impl SpotifyClient {
     /// side.
     pub async fn playlist_track_uris(&self, playlist_id: &str) -> Result<HashSet<String>> {
         #[derive(Deserialize)]
-        struct Item {
-            track: Option<TrackRef>,
+        struct Entry {
+            /// Renamed from `track` in February 2026; alias keeps the old
+            /// shape working for extended-quota apps.
+            #[serde(alias = "track")]
+            item: Option<TrackRef>,
         }
         #[derive(Deserialize)]
         struct TrackRef {
             uri: Option<String>,
         }
 
-        let items: Vec<Item> = self
+        let entries: Vec<Entry> = self
             .get_all(format!(
-                "{API_BASE}/playlists/{playlist_id}/tracks?limit=100&fields=items(track(uri)),next"
+                "{API_BASE}/playlists/{playlist_id}/items?limit=50&fields=items(item(uri)),next"
             ))
             .await?;
 
-        Ok(items
+        Ok(entries
             .into_iter()
-            .filter_map(|i| i.track.and_then(|t| t.uri))
+            .filter_map(|e| e.item.and_then(|t| t.uri))
             .collect())
     }
 
@@ -614,7 +615,7 @@ impl SpotifyClient {
             let body = serde_json::json!({ "uris": chunk });
             self.api_request(
                 reqwest::Method::POST,
-                &format!("{API_BASE}/playlists/{playlist_id}/tracks"),
+                &format!("{API_BASE}/playlists/{playlist_id}/items"),
                 Some(body),
             )
             .await?;
