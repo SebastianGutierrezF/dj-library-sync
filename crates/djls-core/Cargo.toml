@@ -20,6 +20,8 @@ base64 = "0.22"
 thiserror = "2"
 sha2 = "0.10"
 getrandom = "0.2"
+# `bundled` compiles SQLite from source: no system library to install on any platform.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # The OS credential store differs per platform; pick the native backend for each
 # so tokens never touch a plaintext file.

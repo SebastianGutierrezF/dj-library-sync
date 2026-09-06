@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
+use djls_core::db::{Database, PLATFORM_SPOTIFY};
 use djls_core::matcher::{evaluate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::normalize::parse_title;
 use djls_core::tags::{scan_folder, LocalTrack};
@@ -65,6 +66,9 @@ enum Command {
         /// Treat a song that is only available as a shorter cut as no match.
         #[arg(long)]
         reject_shorter: bool,
+        /// Re-query Spotify even for files already matched in a previous run.
+        #[arg(long)]
+        rescan: bool,
         /// Print every track as it is processed.
         #[arg(long)]
         verbose: bool,
@@ -109,10 +113,17 @@ enum Command {
         /// Work out what would be added, then stop without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Re-query Spotify even for files already matched in a previous run.
+        #[arg(long)]
+        rescan: bool,
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
     },
+    /// List tracks nothing could be found for — the AcoustID queue.
+    Misses,
+    /// Show what the local database has recorded.
+    Stats,
 }
 
 /// Tokens live in the OS credential store, never in a file on disk.
@@ -150,6 +161,7 @@ async fn main() -> Result<()> {
             csv,
             accept_shorter,
             reject_shorter,
+            rescan,
             verbose,
         } => {
             let shorter_version = if accept_shorter {
@@ -166,6 +178,7 @@ async fn main() -> Result<()> {
                 market,
                 csv,
                 shorter_version,
+                rescan,
                 verbose,
             )
             .await
@@ -187,6 +200,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Playlists => cmd_playlists().await,
+        Command::Misses => cmd_misses(),
+        Command::Stats => cmd_stats(),
         Command::Push {
             folder,
             playlist,
@@ -195,6 +210,7 @@ async fn main() -> Result<()> {
             market,
             accept_shorter,
             dry_run,
+            rescan,
             yes,
         } => {
             cmd_push(
@@ -209,6 +225,7 @@ async fn main() -> Result<()> {
                     ShorterVersionPolicy::Review
                 },
                 dry_run,
+                rescan,
                 yes,
             )
             .await
@@ -299,6 +316,7 @@ async fn cmd_match(
     market: Option<String>,
     csv_path: Option<PathBuf>,
     shorter_version: ShorterVersionPolicy,
+    rescan: bool,
     verbose: bool,
 ) -> Result<()> {
     let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok().filter(|s| !s.is_empty());
@@ -327,12 +345,35 @@ async fn cmd_match(
         shorter_version,
         ..Thresholds::default()
     };
+    let db = Database::open(&Database::default_path())?;
     let total = tracks.len();
     let mut rows: Vec<Row> = Vec::with_capacity(total);
     let mut failed = 0usize;
+    let mut reused = 0usize;
 
     for (index, track) in tracks.into_iter().enumerate() {
         eprint!("\rMatching {}/{}...", index + 1, total);
+
+        let record = db.upsert_track(&track)?;
+
+        // A file already resolved in a previous run costs nothing to skip,
+        // and skipping is the whole point of keeping state.
+        if !rescan && record.can_reuse_match() {
+            if let Some(stored) = db.stored_match(record.id, PLATFORM_SPOTIFY)? {
+                reused += 1;
+                rows.push(Row {
+                    track,
+                    outcome: MatchOutcome {
+                        verdict: stored.verdict,
+                        method: MatchMethod::None,
+                        candidates: Vec::new(),
+                        reason: format!("{} (from cache)", stored.reason),
+                    },
+                    search_error: None,
+                });
+                continue;
+            }
+        }
 
         // A failed search is not the same thing as a track that isn't on
         // Spotify. Keep the distinction — conflating them turns an outage
@@ -388,13 +429,23 @@ async fn cmd_match(
             );
         }
 
+        // Only record a real answer; a failed search must not be cached as
+        // though Spotify had said "not found".
+        if search_error.is_none() {
+            db.record_match(record.id, PLATFORM_SPOTIFY, &outcome)?;
+        }
+
         rows.push(Row {
             track,
             outcome,
             search_error,
         });
     }
-    eprintln!("\r{}", " ".repeat(30));
+    eprintln!("\r{}", ".".repeat(0));
+
+    if reused > 0 {
+        println!("{reused} track(s) reused from a previous run — pass --rescan to re-query.\n");
+    }
 
     print_summary(&rows, &client);
 
@@ -484,6 +535,7 @@ async fn cmd_push(
     market: Option<String>,
     shorter_version: ShorterVersionPolicy,
     dry_run: bool,
+    rescan: bool,
     assume_yes: bool,
 ) -> Result<()> {
     let client = user_client(market)?;
@@ -503,14 +555,32 @@ async fn cmd_push(
         ..Thresholds::default()
     };
 
+    let db = Database::open(&Database::default_path())?;
     let total = tracks.len();
-    let mut pushable: Vec<(LocalTrack, MatchOutcome)> = Vec::new();
+    let mut pushable: Vec<(LocalTrack, MatchOutcome, i64)> = Vec::new();
     let mut review = 0usize;
     let mut missing = 0usize;
     let mut failed = 0usize;
+    let mut reused = 0usize;
 
     for (index, track) in tracks.into_iter().enumerate() {
         eprint!("\rMatching {}/{}...", index + 1, total);
+
+        let record = db.upsert_track(&track)?;
+
+        if !rescan && record.can_reuse_match() {
+            if let Some(stored) = db.stored_match(record.id, PLATFORM_SPOTIFY)? {
+                reused += 1;
+                match (stored.verdict, stored.platform_uri) {
+                    (Verdict::Auto, Some(uri)) => {
+                        pushable.push((track, cached_outcome(&uri, &stored.reason), record.id))
+                    }
+                    (Verdict::Auto, None) | (Verdict::Review, _) => review += 1,
+                    (Verdict::NoMatch, _) => missing += 1,
+                }
+                continue;
+            }
+        }
 
         let isrc_hits = match &track.isrc {
             Some(isrc) => client.search_isrc(isrc).await.unwrap_or_default(),
@@ -529,15 +599,21 @@ async fn cmd_push(
         };
 
         let outcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
+        db.record_match(record.id, PLATFORM_SPOTIFY, &outcome)?;
+
         match outcome.verdict {
             // Only confident matches are pushed. Everything ambiguous waits for
             // a human — that separation is the whole point of the verdicts.
-            Verdict::Auto => pushable.push((track, outcome)),
+            Verdict::Auto => pushable.push((track, outcome, record.id)),
             Verdict::Review => review += 1,
             Verdict::NoMatch => missing += 1,
         }
     }
     eprintln!("\r{}", " ".repeat(30));
+
+    if reused > 0 {
+        println!("{reused} track(s) reused from a previous run — pass --rescan to re-query.");
+    }
 
     if failed > 0 {
         println!("!! {failed} search(es) failed and were skipped.\n");
@@ -567,19 +643,26 @@ async fn cmd_push(
         None => Default::default(),
     };
 
-    let mut to_add = Vec::new();
+    let mut to_add: Vec<(String, &LocalTrack, i64)> = Vec::new();
     let mut skipped = 0usize;
-    for (track, outcome) in &pushable {
+    for (track, outcome, track_id) in &pushable {
         let Some(best) = outcome.best() else { continue };
-        if already.contains(&best.track.uri) {
+
+        // Three guards: what the playlist currently holds, what we have logged
+        // pushing before, and duplicates within this batch itself.
+        let in_playlist = already.contains(&best.track.uri);
+        let logged = existing
+            .as_ref()
+            .map(|p| db.already_synced(*track_id, &p.id, PLATFORM_SPOTIFY))
+            .transpose()?
+            .unwrap_or(false);
+        let in_batch = to_add.iter().any(|(uri, _, _)| uri == &best.track.uri);
+
+        if in_playlist || logged || in_batch {
             skipped += 1;
             continue;
         }
-        if to_add.iter().any(|(uri, _): &(String, &LocalTrack)| uri == &best.track.uri) {
-            skipped += 1;
-            continue;
-        }
-        to_add.push((best.track.uri.clone(), track));
+        to_add.push((best.track.uri.clone(), track, *track_id));
     }
 
     if skipped > 0 {
@@ -595,7 +678,7 @@ async fn cmd_push(
         to_add.len(),
         if existing.is_some() { "" } else { " (new playlist)" }
     );
-    for (_, track) in to_add.iter().take(10) {
+    for (_, track, _) in to_add.iter().take(10) {
         println!("  {} - {}", track.artist, track.title);
     }
     if to_add.len() > 10 {
@@ -617,10 +700,78 @@ async fn cmd_push(
         None => client.create_playlist(&name, false).await?,
     };
 
-    let uris: Vec<String> = to_add.into_iter().map(|(uri, _)| uri).collect();
+    let uris: Vec<String> = to_add.iter().map(|(uri, _, _)| uri.clone()).collect();
     let added = client.add_tracks_to_playlist(&playlist.id, &uris).await?;
 
+    // Logged only after the write succeeds, so a failed push is retried rather
+    // than silently recorded as done.
+    for (uri, _, track_id) in &to_add {
+        db.record_sync(*track_id, PLATFORM_SPOTIFY, uri, &playlist.id)?;
+    }
+
     println!("Added {added} track(s) to \"{}\".", playlist.name);
+    Ok(())
+}
+
+/// Rebuild a minimal outcome from a cached match, so a reused row can flow
+/// through the same code path as a freshly-matched one.
+fn cached_outcome(uri: &str, reason: &str) -> MatchOutcome {
+    MatchOutcome {
+        verdict: Verdict::Auto,
+        method: MatchMethod::None,
+        candidates: vec![djls_core::Candidate {
+            track: djls_core::SpotifyTrack {
+                id: uri.rsplit(':').next().unwrap_or_default().to_string(),
+                uri: uri.to_string(),
+                name: String::new(),
+                artists: Vec::new(),
+                album: String::new(),
+                duration_ms: 0,
+                isrc: None,
+                url: None,
+                popularity: None,
+            },
+            score: djls_core::Score {
+                total: 1.0,
+                artist: 1.0,
+                title: 1.0,
+                duration: 1.0,
+                mix: 1.0,
+                duration_delta_ms: 0,
+                notes: Vec::new(),
+            },
+        }],
+        reason: format!("{reason} (from cache)"),
+    }
+}
+
+fn cmd_misses() -> Result<()> {
+    let db = Database::open(&Database::default_path())?;
+    let missed = db.missed_tracks(PLATFORM_SPOTIFY)?;
+
+    if missed.is_empty() {
+        println!("Nothing in the no-match queue.");
+        return Ok(());
+    }
+
+    println!("{} track(s) with no match on Spotify:\n", missed.len());
+    for m in &missed {
+        println!("  {} - {}", truncate(&m.artist, 32), truncate(&m.title, 40));
+        println!("    {}", truncate(&m.reason, 68));
+    }
+    println!("\nThese are the candidates for audio fingerprinting later.");
+    Ok(())
+}
+
+fn cmd_stats() -> Result<()> {
+    let path = Database::default_path();
+    let db = Database::open(&path)?;
+    let (tracks, matches, synced) = db.counts()?;
+
+    println!("database   {}", path.display());
+    println!("tracks     {tracks}");
+    println!("matches    {matches}");
+    println!("pushed     {synced}");
     Ok(())
 }
 

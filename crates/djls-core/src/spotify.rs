@@ -152,7 +152,19 @@ impl SpotifyClient {
             } => self.client_credentials_token(client_id, client_secret).await?,
 
             TokenSource::User { config, store } => {
-                let stored = store.load()?.ok_or_else(|| {
+                // Reading the OS credential store can block indefinitely on a
+                // GUI authorization prompt. Say so rather than appearing hung.
+                let nudge = tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    eprintln!(
+                        "Waiting on the OS credential store — if a keychain \
+                         permission dialog is showing, approve it to continue."
+                    );
+                });
+                let loaded = store.load();
+                nudge.abort();
+
+                let stored = loaded?.ok_or_else(|| {
                     anyhow!("not signed in to Spotify — run `djls login` first")
                 })?;
 

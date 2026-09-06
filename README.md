@@ -98,6 +98,28 @@ is the point of the split. The target playlist is created if it doesn't exist
 (default name: `New Downloads <today>`), tracks already in it are skipped so a
 re-run never stacks duplicates, and it asks before writing unless you pass `-y`.
 
+## Local state
+
+Matches and pushes are recorded in SQLite at
+`~/Library/Application Support/dj-library-sync/library.db` (platform data dir
+elsewhere), so a second run over the same folder costs no API calls at all.
+
+```bash
+cargo run -p djls-cli -- stats     # what the database holds
+cargo run -p djls-cli -- misses    # tracks with no match — the AcoustID queue
+```
+
+Identity is not the file path. Rekordbox and Serato rewrite tags on import and
+DJs move files between folders; a moved file keeps its history and a re-tagged
+one is re-matched. Two schema-level guarantees do the work that caller logic
+would otherwise have to get right every time:
+
+- `matches` is unique per `(track_id, platform)` — re-matching updates in place.
+- `sync_log` is unique per `(track_id, playlist_id, platform)` — pushing the
+  same track to the same playlist twice is impossible.
+
+Pass `--rescan` to `match` or `push` to re-query Spotify anyway.
+
 ## The app
 
 
