@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::normalize::{normalize, parse_title, text_similarity, token_set_similarity, MixKind, ParsedTitle};
+use crate::normalize::{parse_title, text_similarity, token_set_similarity, MixKind, ParsedTitle};
 use crate::spotify::SpotifyTrack;
 use crate::tags::LocalTrack;
 
@@ -231,8 +231,48 @@ fn mix_score(local: &ParsedTitle, remote: &ParsedTitle, notes: &mut Vec<String>)
 /// duration plus the same name is enough: a real version difference (radio
 /// vs extended, a different remix) always shows up as one or the other.
 fn same_recording(a: &Candidate, b: &Candidate) -> bool {
-    let dur_delta = (a.track.duration_ms as i64 - b.track.duration_ms as i64).abs();
-    dur_delta <= 3_000 && normalize(&a.track.name) == normalize(&b.track.name)
+    same_recording_meta(
+        &a.track.artist_field(),
+        &a.track.name,
+        a.track.duration_ms,
+        &b.track.artist_field(),
+        &b.track.name,
+        b.track.duration_ms,
+    )
+}
+
+/// Whether two catalogue entries are the same recording.
+///
+/// Spotify frequently lists one recording several times — a single, an album
+/// cut, a re-release — each with its own URI. Comparing URIs alone therefore
+/// cannot tell you whether a track is already in a playlist, which is how the
+/// same song ends up in it twice.
+pub fn same_recording_meta(
+    a_artists: &str,
+    a_title: &str,
+    a_duration_ms: u64,
+    b_artists: &str,
+    b_title: &str,
+    b_duration_ms: u64,
+) -> bool {
+    let delta = (a_duration_ms as i64 - b_duration_ms as i64).abs();
+    if delta > 3_000 {
+        return false;
+    }
+
+    let a = parse_title(a_title);
+    let b = parse_title(b_title);
+
+    // A different remix of the same song is a different recording, however
+    // similar the titles look.
+    match (&a.remixer_norm, &b.remixer_norm) {
+        (Some(x), Some(y)) if text_similarity(x, y) < 0.80 => return false,
+        (Some(_), None) | (None, Some(_)) => return false,
+        _ => {}
+    }
+
+    text_similarity(&a.base, &b.base) >= 0.92
+        && token_set_similarity(a_artists, b_artists) >= 0.80
 }
 
 /// True when the candidate is confidently the same song but a materially
@@ -656,6 +696,43 @@ mod tests {
         let out = evaluate(&track, &[], &[variant], thresholds);
         assert_eq!(out.verdict, Verdict::Review);
         assert!(!out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+    }
+
+    #[test]
+    fn duplicate_catalogue_listings_are_recognised_as_one_recording() {
+        // Real case: the playlist held OUT OF MY HEAD under one URI and the
+        // matcher later picked a different listing of the identical recording.
+        assert!(same_recording_meta(
+            "DONT BLINK", "OUT OF MY HEAD", 199_000,
+            "DONT BLINK", "OUT OF MY HEAD", 199_400,
+        ));
+    }
+
+    #[test]
+    fn a_dash_suffixed_listing_matches_its_bracketed_twin() {
+        assert!(same_recording_meta(
+            "Robotman, Marshall Jefferson", "Do Da Doo (DJ Minx Extended Remix)", 400_000,
+            "Marshall Jefferson, Robotman", "Do Da Doo - DJ Minx Extended Remix", 400_000,
+        ));
+    }
+
+    #[test]
+    fn different_cuts_are_not_treated_as_duplicates() {
+        // Same song, radio vs extended: genuinely two things.
+        assert!(!same_recording_meta(
+            "Kolsch", "Grey (Extended Mix)", 400_000,
+            "Kolsch", "Grey (Radio Edit)", 199_000,
+        ));
+        // Same length, different remixer.
+        assert!(!same_recording_meta(
+            "Kolsch", "Grey (Adam Beyer Remix)", 400_000,
+            "Kolsch", "Grey (Charlotte de Witte Remix)", 400_000,
+        ));
+        // Same length and title, unrelated artist.
+        assert!(!same_recording_meta(
+            "Kolsch", "Grey", 400_000,
+            "Taylor Swift", "Grey", 400_000,
+        ));
     }
 
     #[test]

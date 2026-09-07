@@ -57,6 +57,10 @@ impl TrackRecord {
 #[derive(Debug, Clone)]
 pub struct StoredMatch {
     pub platform_uri: Option<String>,
+    pub platform_name: Option<String>,
+    /// Comma-joined, as Spotify presents them.
+    pub platform_artists: Option<String>,
+    pub platform_duration_ms: Option<u64>,
     pub confidence: f32,
     pub method: String,
     pub verdict: Verdict,
@@ -144,6 +148,18 @@ impl Database {
             "#,
         )
         .context("creating schema")?;
+
+        // Additive migrations. A URI alone turned out to be too little to
+        // reason about a cached match later — comparing recordings needs the
+        // name, artists and duration too. `ALTER TABLE` has no IF NOT EXISTS,
+        // so a duplicate-column error here just means the column already runs.
+        for stmt in [
+            "ALTER TABLE matches ADD COLUMN platform_name TEXT",
+            "ALTER TABLE matches ADD COLUMN platform_artists TEXT",
+            "ALTER TABLE matches ADD COLUMN platform_duration_ms INTEGER",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
 
         Ok(Self { conn })
     }
@@ -261,48 +277,50 @@ impl Database {
         let row = self
             .conn
             .query_row(
-                "SELECT platform_uri, confidence, method, verdict, reason
+                "SELECT platform_uri, confidence, method, verdict, reason,
+                        platform_name, platform_artists, platform_duration_ms
                  FROM matches WHERE track_id = ?1 AND platform = ?2",
                 params![track_id, platform],
                 |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, f64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
+                    Ok(StoredMatch {
+                        platform_uri: row.get(0)?,
+                        confidence: row.get::<_, f64>(1)? as f32,
+                        method: row.get(2)?,
+                        verdict: match row.get::<_, String>(3)?.as_str() {
+                            "auto" => Verdict::Auto,
+                            "review" => Verdict::Review,
+                            _ => Verdict::NoMatch,
+                        },
+                        reason: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        platform_name: row.get(5)?,
+                        platform_artists: row.get(6)?,
+                        platform_duration_ms: row.get::<_, Option<i64>>(7)?.map(|d| d as u64),
+                    })
                 },
             )
             .optional()?;
 
-        Ok(row.map(|(uri, confidence, method, verdict, reason)| StoredMatch {
-            platform_uri: uri,
-            confidence: confidence as f32,
-            verdict: match verdict.as_str() {
-                "auto" => Verdict::Auto,
-                "review" => Verdict::Review,
-                _ => Verdict::NoMatch,
-            },
-            method,
-            reason: reason.unwrap_or_default(),
-        }))
+        Ok(row)
     }
 
     pub fn record_match(&self, track_id: i64, platform: &str, outcome: &MatchOutcome) -> Result<()> {
         let best = outcome.best();
         self.conn.execute(
             "INSERT INTO matches (track_id, platform, platform_track_id, platform_uri,
-                                  confidence, method, verdict, reason, matched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                  confidence, method, verdict, reason, matched_at,
+                                  platform_name, platform_artists, platform_duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(track_id, platform) DO UPDATE SET
-                platform_track_id = excluded.platform_track_id,
-                platform_uri      = excluded.platform_uri,
-                confidence        = excluded.confidence,
-                method            = excluded.method,
-                verdict           = excluded.verdict,
-                reason            = excluded.reason,
-                matched_at        = excluded.matched_at",
+                platform_track_id    = excluded.platform_track_id,
+                platform_uri         = excluded.platform_uri,
+                confidence           = excluded.confidence,
+                method               = excluded.method,
+                verdict              = excluded.verdict,
+                reason               = excluded.reason,
+                matched_at           = excluded.matched_at,
+                platform_name        = excluded.platform_name,
+                platform_artists     = excluded.platform_artists,
+                platform_duration_ms = excluded.platform_duration_ms",
             params![
                 track_id,
                 platform,
@@ -312,7 +330,10 @@ impl Database {
                 outcome.method.as_str(),
                 outcome.verdict.as_str(),
                 outcome.reason,
-                now()
+                now(),
+                best.map(|c| c.track.name.clone()),
+                best.map(|c| c.track.artist_field()),
+                best.map(|c| c.track.duration_ms as i64)
             ],
         )?;
         Ok(())
@@ -483,6 +504,10 @@ mod tests {
         let stored = db.stored_match(id, PLATFORM_SPOTIFY).unwrap().unwrap();
         assert_eq!(stored.verdict, Verdict::Auto);
         assert_eq!(stored.platform_uri.as_deref(), Some("spotify:track:2"));
+        // Enough metadata to compare recordings later, not just an opaque URI.
+        assert_eq!(stored.platform_name.as_deref(), Some("Song"));
+        assert_eq!(stored.platform_artists.as_deref(), Some("A"));
+        assert_eq!(stored.platform_duration_ms, Some(400_000));
         assert_eq!(db.counts().unwrap().1, 1, "re-matching must update, not duplicate");
     }
 

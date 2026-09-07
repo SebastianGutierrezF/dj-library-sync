@@ -571,11 +571,11 @@ async fn cmd_push(
         if !rescan && record.can_reuse_match() {
             if let Some(stored) = db.stored_match(record.id, PLATFORM_SPOTIFY)? {
                 reused += 1;
-                match (stored.verdict, stored.platform_uri) {
-                    (Verdict::Auto, Some(uri)) => {
-                        pushable.push((track, cached_outcome(&uri, &stored.reason), record.id))
+                match (stored.verdict, stored.platform_uri.is_some()) {
+                    (Verdict::Auto, true) => {
+                        pushable.push((track, cached_outcome(&stored), record.id))
                     }
-                    (Verdict::Auto, None) | (Verdict::Review, _) => review += 1,
+                    (Verdict::Auto, false) | (Verdict::Review, _) => review += 1,
                     (Verdict::NoMatch, _) => missing += 1,
                 }
                 continue;
@@ -638,9 +638,9 @@ async fn cmd_push(
 
     // Re-running must not stack duplicates; Spotify will happily add the same
     // track twice if asked.
-    let already: std::collections::HashSet<String> = match &existing {
-        Some(p) => client.playlist_track_uris(&p.id).await?,
-        None => Default::default(),
+    let already = match &existing {
+        Some(p) => client.playlist_entries(&p.id).await?,
+        None => Vec::new(),
     };
 
     let mut to_add: Vec<(String, &LocalTrack, i64)> = Vec::new();
@@ -649,8 +649,11 @@ async fn cmd_push(
         let Some(best) = outcome.best() else { continue };
 
         // Three guards: what the playlist currently holds, what we have logged
-        // pushing before, and duplicates within this batch itself.
-        let in_playlist = already.contains(&best.track.uri);
+        // pushing before, and duplicates within this batch itself. The first
+        // compares recordings rather than URIs, because Spotify indexes the
+        // same recording under several of them.
+        let in_playlist = already.iter().any(|e| e.is_same_recording_as(&best.track));
+
         let logged = existing
             .as_ref()
             .map(|p| db.already_synced(*track_id, &p.id, PLATFORM_SPOTIFY))
@@ -713,20 +716,26 @@ async fn cmd_push(
     Ok(())
 }
 
-/// Rebuild a minimal outcome from a cached match, so a reused row can flow
-/// through the same code path as a freshly-matched one.
-fn cached_outcome(uri: &str, reason: &str) -> MatchOutcome {
+/// Rebuild an outcome from a cached match, so a reused row can flow through
+/// the same code path as a freshly-matched one — including the duplicate
+/// check, which needs real metadata rather than a bare URI.
+fn cached_outcome(stored: &djls_core::db::StoredMatch) -> MatchOutcome {
+    let uri = stored.platform_uri.clone().unwrap_or_default();
     MatchOutcome {
         verdict: Verdict::Auto,
         method: MatchMethod::None,
         candidates: vec![djls_core::Candidate {
             track: djls_core::SpotifyTrack {
                 id: uri.rsplit(':').next().unwrap_or_default().to_string(),
-                uri: uri.to_string(),
-                name: String::new(),
-                artists: Vec::new(),
+                uri: uri.clone(),
+                name: stored.platform_name.clone().unwrap_or_default(),
+                artists: stored
+                    .platform_artists
+                    .as_deref()
+                    .map(|a| a.split(", ").map(|s| s.to_string()).collect())
+                    .unwrap_or_default(),
                 album: String::new(),
-                duration_ms: 0,
+                duration_ms: stored.platform_duration_ms.unwrap_or(0),
                 isrc: None,
                 url: None,
                 popularity: None,
@@ -741,7 +750,7 @@ fn cached_outcome(uri: &str, reason: &str) -> MatchOutcome {
                 notes: Vec::new(),
             },
         }],
-        reason: format!("{reason} (from cache)"),
+        reason: format!("{} (from cache)", stored.reason),
     }
 }
 

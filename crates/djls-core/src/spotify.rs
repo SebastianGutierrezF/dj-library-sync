@@ -427,6 +427,35 @@ pub struct Playlist {
     pub items: Option<PlaylistItemsRef>,
 }
 
+/// One track already sitting in a playlist.
+#[derive(Debug, Clone)]
+pub struct PlaylistEntry {
+    pub uri: String,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub duration_ms: u64,
+}
+
+impl PlaylistEntry {
+    pub fn artist_field(&self) -> String {
+        self.artists.join(", ")
+    }
+
+    /// Whether this entry is the same recording as a candidate, even if
+    /// Spotify indexes them under different URIs.
+    pub fn is_same_recording_as(&self, track: &SpotifyTrack) -> bool {
+        self.uri == track.uri
+            || crate::matcher::same_recording_meta(
+                &self.artist_field(),
+                &self.name,
+                self.duration_ms,
+                &track.artist_field(),
+                &track.name,
+                track.duration_ms,
+            )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlaylistOwner {
     pub id: String,
@@ -589,12 +618,14 @@ impl SpotifyClient {
         serde_json::from_str(&text).context("parsing created playlist")
     }
 
-    /// Track URIs already in a playlist, so a re-run does not add duplicates.
-    /// Spotify happily accepts the same track twice — nothing stops it server
-    /// side.
-    pub async fn playlist_track_uris(&self, playlist_id: &str) -> Result<HashSet<String>> {
+    /// What a playlist already holds.
+    ///
+    /// Returns full metadata, not just URIs: Spotify lists the same recording
+    /// under several URIs (single, album cut, re-release), so a URI comparison
+    /// alone cannot tell whether a track is already in the playlist.
+    pub async fn playlist_entries(&self, playlist_id: &str) -> Result<Vec<PlaylistEntry>> {
         #[derive(Deserialize)]
-        struct Entry {
+        struct Row {
             /// Renamed from `track` in February 2026; alias keeps the old
             /// shape working for extended-quota apps.
             #[serde(alias = "track")]
@@ -603,17 +634,43 @@ impl SpotifyClient {
         #[derive(Deserialize)]
         struct TrackRef {
             uri: Option<String>,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            artists: Vec<ApiArtist>,
+            #[serde(default)]
+            duration_ms: u64,
         }
 
-        let entries: Vec<Entry> = self
+        let rows: Vec<Row> = self
+            // No `fields` filter here on purpose: trimming the response has
+            // silently dropped the very metadata the duplicate check needs.
             .get_all(format!(
-                "{API_BASE}/playlists/{playlist_id}/items?limit=50&fields=items(item(uri)),next"
+                "{API_BASE}/playlists/{playlist_id}/items?limit=50"
             ))
             .await?;
 
-        Ok(entries
+        Ok(rows
             .into_iter()
-            .filter_map(|e| e.item.and_then(|t| t.uri))
+            .filter_map(|r| r.item)
+            .filter_map(|t| {
+                t.uri.map(|uri| PlaylistEntry {
+                    uri,
+                    name: t.name,
+                    artists: t.artists.into_iter().map(|a| a.name).collect(),
+                    duration_ms: t.duration_ms,
+                })
+            })
+            .collect())
+    }
+
+    /// Just the URIs, when metadata is not needed.
+    pub async fn playlist_track_uris(&self, playlist_id: &str) -> Result<HashSet<String>> {
+        Ok(self
+            .playlist_entries(playlist_id)
+            .await?
+            .into_iter()
+            .map(|e| e.uri)
             .collect())
     }
 

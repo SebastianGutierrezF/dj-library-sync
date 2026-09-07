@@ -154,7 +154,19 @@ export default function App() {
   const push = useCallback(async () => {
     const items = rows
       .filter((r) => selected.has(r.track_id))
-      .map((r) => ({ track_id: r.track_id, uri: chosen[r.track_id] }))
+      .map((r) => {
+        const uri = chosen[r.track_id];
+        const c = r.candidates.find((x) => x.track.uri === uri);
+        return {
+          track_id: r.track_id,
+          uri,
+          // Sent so the backend can spot the same recording under a
+          // different Spotify URI, not just an identical one.
+          name: c?.track.name ?? "",
+          artists: c?.track.artists.join(", ") ?? "",
+          duration_ms: c?.track.duration_ms ?? 0,
+        };
+      })
       .filter((i) => Boolean(i.uri));
 
     if (items.length === 0 || !config) return;

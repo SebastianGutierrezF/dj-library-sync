@@ -373,10 +373,19 @@ async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
         .collect())
 }
 
+/// Carries the matched track's metadata, not just its URI: Spotify lists one
+/// recording under several URIs, so the already-in-playlist check has to
+/// compare recordings.
 #[derive(Deserialize)]
 struct PushItem {
     track_id: i64,
     uri: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    artists: String,
+    #[serde(default)]
+    duration_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -400,8 +409,8 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
         .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_owned_by(&me.id));
 
     let already = match &existing {
-        Some(p) => client.playlist_track_uris(&p.id).await.unwrap_or_default(),
-        None => Default::default(),
+        Some(p) => client.playlist_entries(&p.id).await.unwrap_or_default(),
+        None => Vec::new(),
     };
 
     let playlist = match existing {
@@ -423,7 +432,19 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
             .unwrap_or(false);
         let dupe = to_add.iter().any(|(_, uri)| uri == &item.uri);
 
-        if already.contains(&item.uri) || logged || dupe {
+        let in_playlist = already.iter().any(|e| {
+            e.uri == item.uri
+                || djls_core::matcher::same_recording_meta(
+                    &e.artist_field(),
+                    &e.name,
+                    e.duration_ms,
+                    &item.artists,
+                    &item.name,
+                    item.duration_ms,
+                )
+        });
+
+        if in_playlist || logged || dupe {
             skipped += 1;
             continue;
         }
