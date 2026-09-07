@@ -757,3 +757,39 @@ impl ApiTrack {
         })
     }
 }
+
+
+#[async_trait::async_trait]
+impl crate::platform::MusicPlatform for SpotifyClient {
+    fn info(&self) -> crate::platform::PlatformInfo {
+        crate::platform::PlatformInfo::SPOTIFY
+    }
+
+    async fn current_user(&self) -> Result<SpotifyUser> {
+        SpotifyClient::current_user(self).await
+    }
+
+    async fn search_isrc(&self, isrc: &str) -> Result<Vec<SpotifyTrack>> {
+        SpotifyClient::search_isrc(self, isrc).await
+    }
+
+    async fn search_for_track(&self, local: &LocalTrack, limit: u32) -> Result<Vec<SpotifyTrack>> {
+        SpotifyClient::search_for_track(self, local, limit).await
+    }
+
+    async fn list_playlists(&self) -> Result<Vec<Playlist>> {
+        SpotifyClient::list_playlists(self).await
+    }
+
+    async fn create_playlist(&self, name: &str, public: bool) -> Result<Playlist> {
+        SpotifyClient::create_playlist(self, name, public).await
+    }
+
+    async fn playlist_entries(&self, playlist_id: &str) -> Result<Vec<PlaylistEntry>> {
+        SpotifyClient::playlist_entries(self, playlist_id).await
+    }
+
+    async fn add_tracks(&self, playlist_id: &str, uris: &[String]) -> Result<usize> {
+        SpotifyClient::add_tracks_to_playlist(self, playlist_id, uris).await
+    }
+}

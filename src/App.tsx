@@ -54,17 +54,24 @@ export default function App() {
     setAccount(await invoke<AccountStatus>("account_status"));
   }, []);
 
+  const [bootError, setBootError] = useState<string | null>(null);
+
   useEffect(() => {
     (async () => {
-      const cfg = await invoke<AppConfig>("load_config");
-      setConfig(cfg);
-      setPlaylistName(cfg.last_playlist ?? defaultPlaylistName());
       try {
-        setRedirect(await invoke<string>("redirect_uri"));
-      } catch {
-        /* no client id yet */
+        const cfg = await invoke<AppConfig>("load_config");
+        setConfig(cfg);
+        setPlaylistName(cfg.last_playlist ?? defaultPlaylistName());
+        try {
+          setRedirect(await invoke<string>("redirect_uri"));
+        } catch {
+          /* no client id yet */
+        }
+        await refreshAccount();
+      } catch (err) {
+        // Without this the window sits on "Loading…" forever with no clue why.
+        setBootError(String(err));
       }
-      await refreshAccount();
     })();
 
     const unlisten = listen<{ done: number; total: number }>("match-progress", (e) =>
@@ -190,6 +197,19 @@ export default function App() {
   }, [rows]);
 
   const readyToPush = rows.filter((r) => selected.has(r.track_id) && chosen[r.track_id]).length;
+
+  if (bootError) {
+    return (
+      <div className="app">
+        <h1>DJ Library Sync</h1>
+        <div className="banner error">Could not start: {bootError}</div>
+        <p className="dim">
+          This build talks to a Tauri backend. Opening the dev server directly in
+          a browser shows the interface but cannot reach it.
+        </p>
+      </div>
+    );
+  }
 
   if (!config) return <div className="app"><p className="dim">Loading…</p></div>;
 
