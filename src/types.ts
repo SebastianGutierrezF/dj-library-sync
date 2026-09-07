@@ -47,3 +47,71 @@ export interface DetectedFile {
   track: LocalTrack | null;
   error: string | null;
 }
+
+export interface SpotifyTrack {
+  id: string;
+  uri: string;
+  name: string;
+  artists: string[];
+  album: string;
+  duration_ms: number;
+  isrc: string | null;
+  url: string | null;
+  popularity: number | null;
+}
+
+export interface Score {
+  total: number;
+  artist: number;
+  title: number;
+  duration: number;
+  mix: number;
+  duration_delta_ms: number;
+  notes: string[];
+}
+
+export interface Candidate {
+  track: SpotifyTrack;
+  score: Score;
+}
+
+export type Verdict = "auto" | "review" | "no_match";
+
+export interface MatchRow {
+  track_id: number;
+  track: LocalTrack;
+  verdict: Verdict;
+  method: string;
+  confidence: number;
+  reason: string;
+  candidates: Candidate[];
+  cached: boolean;
+}
+
+export interface AppConfig {
+  spotify_client_id: string | null;
+  watch_folder: string | null;
+  accept_shorter: boolean;
+  last_playlist: string | null;
+}
+
+export interface AccountStatus {
+  configured: boolean;
+  signed_in: boolean;
+  display_name: string | null;
+  user_id: string | null;
+  error: string | null;
+}
+
+export interface PlaylistInfo {
+  id: string;
+  name: string;
+  track_count: number | null;
+  owned: boolean;
+}
+
+export interface PushResult {
+  playlist_name: string;
+  added: number;
+  skipped: number;
+}
