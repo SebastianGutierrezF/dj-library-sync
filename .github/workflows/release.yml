@@ -9,6 +9,12 @@ on:
 
 jobs:
   build:
+    # Creating a release is a write. Workflow tokens default to read-only, and
+    # without this every platform fails at the very end with
+    # "Resource not accessible by integration" after a full build.
+    permissions:
+      contents: write
+
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +28,13 @@ jobs:
           - os: windows-latest
             args: ""
     runs-on: ${{ matrix.os }}
+
+    # Secrets cannot be read directly in a step's `if`, so the decision is
+    # hoisted here. Signing is all-or-nothing: a half-configured certificate
+    # fails the build rather than producing an unsigned app.
+    env:
+      SIGN_MACOS: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -41,19 +54,34 @@ jobs:
 
       - run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      # Two near-identical steps rather than one with optional secrets: passing
+      # an empty APPLE_CERTIFICATE makes tauri-action attempt a codesign and
+      # fail on the import, instead of quietly building unsigned.
+      - name: Build and release (signed)
+        if: env.SIGN_MACOS == 'true'
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signing and notarisation. Without these the macOS build is
-          # unsigned and Gatekeeper tells users the app is damaged — which
-          # undercuts the point of publishing the source. All five come from
-          # an Apple Developer Program membership; the same one MusicKit needs.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DJ Library Sync ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # Until the Apple secrets exist. macOS will report the download as
+      # damaged; see docs/apple-setup.md.
+      - name: Build and release (unsigned)
+        if: env.SIGN_MACOS != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DJ Library Sync ${{ github.ref_name }}"
