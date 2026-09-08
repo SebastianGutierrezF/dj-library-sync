@@ -6,6 +6,7 @@ import type {
   AccountStatus,
   AppConfig,
   Candidate,
+  DetectedFile,
   LocalTrack,
   MatchRow,
   MixKind,
@@ -41,6 +42,8 @@ export default function App() {
   const [redirect, setRedirect] = useState<string>("");
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
   const [connecting, setConnecting] = useState<string | null>(null);
+  /** Files the watcher has seen land since the last match. */
+  const [pending, setPending] = useState<string[]>([]);
 
   const [rows, setRows] = useState<MatchRow[]>([]);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
@@ -78,11 +81,21 @@ export default function App() {
       }
     })();
 
-    const unlisten = listen<{ done: number; total: number }>("match-progress", (e) =>
+    const unlistenProgress = listen<{ done: number; total: number }>("match-progress", (e) =>
       setProgress(e.payload)
     );
+
+    // The watcher is the whole point of the app: downloads should show up
+    // without anyone opening anything. The backend emits one of these per file
+    // once it has stopped growing.
+    const unlistenDetected = listen<DetectedFile>("track-detected", (e) => {
+      const name = e.payload.track?.file_name ?? e.payload.path;
+      setPending((prev) => (prev.includes(name) ? prev : [...prev, name]));
+    });
+
     return () => {
-      void unlisten.then((fn) => fn());
+      void unlistenProgress.then((fn) => fn());
+      void unlistenDetected.then((fn) => fn());
     };
   }, [refreshAccount]);
 
@@ -136,6 +149,7 @@ export default function App() {
           rescan,
         });
         setRows(found);
+        setPending([]);
         // Confident matches are pre-selected; everything else waits for a
         // decision, which is the entire point of the verdict split.
         setSelected(new Set(found.filter((r) => r.verdict === "auto").map((r) => r.track_id)));
@@ -320,6 +334,16 @@ export default function App() {
       </header>
 
       {busy && <div className="banner">{busy}{progress ? ` ${progress.done}/${progress.total}` : ""}</div>}
+
+      {!busy && pending.length > 0 && (
+        <div className="banner good arrivals">
+          <span>
+            {pending.length} new {pending.length === 1 ? "download" : "downloads"} landed
+            <span className="dim small"> — {pending.slice(-3).join(", ")}</span>
+          </span>
+          <button onClick={() => runMatch(false)}>Match them</button>
+        </div>
+      )}
       {error && <div className="banner error">{error}</div>}
       {result && (
         <div className="banner good">

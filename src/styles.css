@@ -258,3 +258,11 @@ button.link {
 .setup ol { margin: 12px 0; padding-left: 20px; font-size: 12px; line-height: 1.9; }
 .setup li { padding-left: 2px; }
 .setup .row { margin-top: 12px; }
+
+.banner.arrivals {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.banner.arrivals button { padding: 5px 12px; font-size: 12px; }
