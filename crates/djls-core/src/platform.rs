@@ -80,8 +80,7 @@ impl PlatformInfo {
     };
 
     /// Everything the connect screen should offer, in display order.
-    pub const ALL: &'static [PlatformInfo] =
-        &[Self::SPOTIFY, Self::APPLE_MUSIC, Self::TIDAL];
+    pub const ALL: &'static [PlatformInfo] = &[Self::SPOTIFY, Self::APPLE_MUSIC, Self::TIDAL];
 }
 
 /// What a streaming service has to do to be a sync target.

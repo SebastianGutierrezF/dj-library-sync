@@ -30,7 +30,10 @@ const MIN_ATTEMPTS_BEFORE_ABORT: usize = 5;
 const ABORT_ERROR_RATE: f64 = 0.5;
 
 #[derive(Parser)]
-#[command(name = "djls", about = "DJ Library Sync — headless matcher and folder watcher")]
+#[command(
+    name = "djls",
+    about = "DJ Library Sync — headless matcher and folder watcher"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -136,9 +139,7 @@ fn auth_config() -> Result<AuthConfig> {
     let client_id = std::env::var("SPOTIFY_CLIENT_ID")
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Set SPOTIFY_CLIENT_ID (copy .env.example to .env)")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("Set SPOTIFY_CLIENT_ID (copy .env.example to .env)"))?;
     Ok(AuthConfig::new(client_id))
 }
 
@@ -152,7 +153,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Scan { folder, no_recursive } => cmd_scan(&folder, !no_recursive),
+        Command::Scan {
+            folder,
+            no_recursive,
+        } => cmd_scan(&folder, !no_recursive),
         Command::Match {
             folder,
             no_recursive,
@@ -185,7 +189,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Watch { folder, include_existing } => cmd_watch(&folder, include_existing),
+        Command::Watch {
+            folder,
+            include_existing,
+        } => cmd_watch(&folder, include_existing),
         Command::Login { no_browser } => cmd_login(no_browser).await,
         Command::Logout => {
             token_store().clear()?;
@@ -238,7 +245,14 @@ async fn main() -> Result<()> {
             println!("base       {}", p.base);
             println!("kind       {:?}", p.kind);
             println!("remixer    {}", p.remixer.as_deref().unwrap_or("-"));
-            println!("featured   {}", if p.featured.is_empty() { "-".to_string() } else { p.featured.join(", ") });
+            println!(
+                "featured   {}",
+                if p.featured.is_empty() {
+                    "-".to_string()
+                } else {
+                    p.featured.join(", ")
+                }
+            );
             println!("descriptor {}", p.descriptor_label());
             Ok(())
         }
@@ -333,8 +347,12 @@ async fn cmd_match(folder: &Path, opts: MatchOptions) -> Result<()> {
         rescan,
         verbose,
     } = opts;
-    let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok().filter(|s| !s.is_empty());
-    let client_secret = std::env::var("SPOTIFY_CLIENT_SECRET").ok().filter(|s| !s.is_empty());
+    let client_id = std::env::var("SPOTIFY_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let client_secret = std::env::var("SPOTIFY_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let (Some(client_id), Some(client_secret)) = (client_id, client_secret) else {
         bail!(
@@ -480,7 +498,6 @@ struct Row {
     outcome: MatchOutcome,
     search_error: Option<String>,
 }
-
 
 async fn cmd_login(no_browser: bool) -> Result<()> {
     let config = auth_config()?;
@@ -693,7 +710,11 @@ async fn cmd_push(
     println!(
         "\nWould add {} track(s) to \"{name}\"{}:",
         to_add.len(),
-        if existing.is_some() { "" } else { " (new playlist)" }
+        if existing.is_some() {
+            ""
+        } else {
+            " (new playlist)"
+        }
     );
     for (_, track, _) in to_add.iter().take(10) {
         println!("  {} - {}", track.artist, track.title);
@@ -892,7 +913,10 @@ fn print_summary(rows: &[Row], client: &SpotifyClient) {
 
     println!("\n=== Match rate over {total} track(s) ===\n");
     println!("  auto-push      {auto:>4}   {:>5.1}%", pct(auto, total));
-    println!("  needs review   {review:>4}   {:>5.1}%", pct(review, total));
+    println!(
+        "  needs review   {review:>4}   {:>5.1}%",
+        pct(review, total)
+    );
     println!("  no match       {miss:>4}   {:>5.1}%", pct(miss, total));
 
     println!("\n  matched via:");
@@ -976,10 +1000,14 @@ fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
                 .unwrap_or_default(),
             best.and_then(|c| c.track.url.clone()).unwrap_or_default(),
             best.map(|c| c.track.uri.clone()).unwrap_or_default(),
-            best.map(|c| format!("{:.2}", c.score.artist)).unwrap_or_default(),
-            best.map(|c| format!("{:.2}", c.score.title)).unwrap_or_default(),
-            best.map(|c| format!("{:.2}", c.score.duration)).unwrap_or_default(),
-            best.map(|c| format!("{:.2}", c.score.mix)).unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.artist))
+                .unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.title))
+                .unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.duration))
+                .unwrap_or_default(),
+            best.map(|c| format!("{:.2}", c.score.mix))
+                .unwrap_or_default(),
             outcome
                 .candidates
                 .get(1)
@@ -1009,7 +1037,10 @@ fn cmd_watch(folder: &Path, include_existing: bool) -> Result<()> {
         bail!("{} is not a folder", folder.display());
     }
 
-    println!("Watching {} — drop a file in to test. Ctrl-C to stop.\n", folder.display());
+    println!(
+        "Watching {} — drop a file in to test. Ctrl-C to stop.\n",
+        folder.display()
+    );
 
     let config = WatcherConfig {
         emit_existing: include_existing,

@@ -203,7 +203,11 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(1_200));
         let found = seen.lock().unwrap().clone();
-        assert_eq!(found.len(), 1, "expected exactly one emission, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one emission, got {found:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

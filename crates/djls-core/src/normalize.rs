@@ -50,7 +50,10 @@ impl MixKind {
     /// True when the descriptor implies a different performer/producer cut the
     /// record, not just a different length of the same recording.
     pub fn is_derivative(self) -> bool {
-        matches!(self, MixKind::Remix | MixKind::Rework | MixKind::Edit | MixKind::Vip)
+        matches!(
+            self,
+            MixKind::Remix | MixKind::Rework | MixKind::Edit | MixKind::Vip
+        )
     }
 
     /// Descriptors that mean "the full-length club version".
@@ -135,7 +138,17 @@ pub fn normalize(input: &str) -> String {
 /// identifying signal.
 pub fn tokens(input: &str) -> BTreeSet<String> {
     const STOP: &[&str] = &[
-        "feat", "featuring", "ft", "with", "and", "vs", "versus", "pres", "presents", "the", "a",
+        "feat",
+        "featuring",
+        "ft",
+        "with",
+        "and",
+        "vs",
+        "versus",
+        "pres",
+        "presents",
+        "the",
+        "a",
     ];
     normalize(input)
         .split_whitespace()
@@ -188,8 +201,22 @@ pub fn text_similarity(a: &str, b: &str) -> f32 {
 /// like "Above & Beyond" must not be split apart during comparison.
 pub fn split_artists(input: &str) -> Vec<String> {
     const SEPS: &[&str] = &[
-        " feat. ", " feat ", " ft. ", " ft ", " featuring ", " with ", " vs. ", " vs ", " x ",
-        " pres. ", " presents ", ",", ";", " & ", " and ", "/",
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        " with ",
+        " vs. ",
+        " vs ",
+        " x ",
+        " pres. ",
+        " presents ",
+        ",",
+        ";",
+        " & ",
+        " and ",
+        "/",
     ];
 
     let mut parts = vec![input.to_string()];
@@ -286,7 +313,15 @@ fn classify_segment(segment: &str) -> Option<(MixKind, Option<String>)> {
 /// Turn "someone's" / "someone" into a comparable remixer name, dropping
 /// leftover qualifiers like "extended".
 fn clean_remixer(prefix: &str) -> Option<String> {
-    const NOISE: &[&str] = &["extended", "club", "dub", "official", "the", "vocal", "instrumental"];
+    const NOISE: &[&str] = &[
+        "extended",
+        "club",
+        "dub",
+        "official",
+        "the",
+        "vocal",
+        "instrumental",
+    ];
     let mut cleaned: Vec<&str> = prefix
         .split_whitespace()
         .filter(|w| !NOISE.contains(w))
@@ -430,7 +465,11 @@ pub fn parse_title(raw: &str) -> ParsedTitle {
     }
 
     let base = base.trim().trim_end_matches('-').trim().to_string();
-    let base = if base.is_empty() { raw.trim().to_string() } else { base };
+    let base = if base.is_empty() {
+        raw.trim().to_string()
+    } else {
+        base
+    };
 
     ParsedTitle {
         raw: raw.to_string(),

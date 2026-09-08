@@ -129,7 +129,6 @@ fn watched_folder(state: State<WatchState>) -> Result<Option<String>, String> {
         .map(|p| p.display().to_string()))
 }
 
-
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -199,7 +198,11 @@ async fn account_status() -> AccountStatus {
                 // "not signed in" is an expected state, not an error to show.
                 error: {
                     let text = format!("{err:#}");
-                    if text.contains("not signed in") { None } else { Some(text) }
+                    if text.contains("not signed in") {
+                        None
+                    } else {
+                        Some(text)
+                    }
                 },
             },
         },
@@ -233,7 +236,9 @@ async fn spotify_login(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn spotify_logout() -> Result<(), String> {
-    KeyringStore::default().clear().map_err(|e| format!("{e:#}"))
+    KeyringStore::default()
+        .clear()
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// What the connect screen needs to render each platform.
@@ -395,7 +400,10 @@ struct PlaylistInfo {
 async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
     let client = user_client()?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
-    let playlists = client.list_playlists().await.map_err(|e| format!("{e:#}"))?;
+    let playlists = client
+        .list_playlists()
+        .await
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(playlists
         .into_iter()

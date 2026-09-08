@@ -303,7 +303,12 @@ impl Database {
         Ok(row)
     }
 
-    pub fn record_match(&self, track_id: i64, platform: &str, outcome: &MatchOutcome) -> Result<()> {
+    pub fn record_match(
+        &self,
+        track_id: i64,
+        platform: &str,
+        outcome: &MatchOutcome,
+    ) -> Result<()> {
         let best = outcome.best();
         self.conn.execute(
             "INSERT INTO matches (track_id, platform, platform_track_id, platform_uri,
@@ -390,9 +395,15 @@ impl Database {
     }
 
     pub fn counts(&self) -> Result<(i64, i64, i64)> {
-        let tracks = self.conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
-        let matches = self.conn.query_row("SELECT COUNT(*) FROM matches", [], |r| r.get(0))?;
-        let synced = self.conn.query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))?;
+        let tracks = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
+        let matches = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM matches", [], |r| r.get(0))?;
+        let synced = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))?;
         Ok((tracks, matches, synced))
     }
 }
@@ -400,11 +411,17 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matcher::{Candidate, MatchMethod, Score};
     use crate::normalize::parse_title;
     use crate::spotify::SpotifyTrack;
-    use crate::matcher::{Candidate, MatchMethod, Score};
 
-    fn track(path: &str, artist: &str, title: &str, duration_ms: u64, isrc: Option<&str>) -> LocalTrack {
+    fn track(
+        path: &str,
+        artist: &str,
+        title: &str,
+        duration_ms: u64,
+        isrc: Option<&str>,
+    ) -> LocalTrack {
         LocalTrack {
             path: PathBuf::from(path),
             file_name: path.rsplit('/').next().unwrap().to_string(),
@@ -466,8 +483,20 @@ mod tests {
         // Same recording, new folder. Re-matching it would waste an API call
         // and lose its sync history.
         let db = Database::open_in_memory().unwrap();
-        let before = track("/m/a.aiff", "Kolsch", "Grey (Extended Mix)", 400_000, Some("X1"));
-        let after = track("/other/a.aiff", "Kolsch", "Grey (Extended Mix)", 400_000, Some("X1"));
+        let before = track(
+            "/m/a.aiff",
+            "Kolsch",
+            "Grey (Extended Mix)",
+            400_000,
+            Some("X1"),
+        );
+        let after = track(
+            "/other/a.aiff",
+            "Kolsch",
+            "Grey (Extended Mix)",
+            400_000,
+            Some("X1"),
+        );
 
         let first = db.upsert_track(&before).unwrap();
         let moved = db.upsert_track(&after).unwrap();
@@ -489,7 +518,10 @@ mod tests {
         let changed = db.upsert_track(&after).unwrap();
 
         assert_eq!(changed.state, TrackState::Retagged);
-        assert!(!changed.can_reuse_match(), "changed tags must force a re-match");
+        assert!(
+            !changed.can_reuse_match(),
+            "changed tags must force a re-match"
+        );
     }
 
     #[test]
@@ -498,8 +530,18 @@ mod tests {
         let t = track("/m/a.aiff", "Kolsch", "Grey", 400_000, None);
         let id = db.upsert_track(&t).unwrap().id;
 
-        db.record_match(id, PLATFORM_SPOTIFY, &outcome(Verdict::Review, "spotify:track:1")).unwrap();
-        db.record_match(id, PLATFORM_SPOTIFY, &outcome(Verdict::Auto, "spotify:track:2")).unwrap();
+        db.record_match(
+            id,
+            PLATFORM_SPOTIFY,
+            &outcome(Verdict::Review, "spotify:track:1"),
+        )
+        .unwrap();
+        db.record_match(
+            id,
+            PLATFORM_SPOTIFY,
+            &outcome(Verdict::Auto, "spotify:track:2"),
+        )
+        .unwrap();
 
         let stored = db.stored_match(id, PLATFORM_SPOTIFY).unwrap().unwrap();
         assert_eq!(stored.verdict, Verdict::Auto);
@@ -508,7 +550,11 @@ mod tests {
         assert_eq!(stored.platform_name.as_deref(), Some("Song"));
         assert_eq!(stored.platform_artists.as_deref(), Some("A"));
         assert_eq!(stored.platform_duration_ms, Some(400_000));
-        assert_eq!(db.counts().unwrap().1, 1, "re-matching must update, not duplicate");
+        assert_eq!(
+            db.counts().unwrap().1,
+            1,
+            "re-matching must update, not duplicate"
+        );
     }
 
     #[test]
@@ -518,15 +564,21 @@ mod tests {
         let id = db.upsert_track(&t).unwrap().id;
 
         assert!(!db.already_synced(id, "pl1", PLATFORM_SPOTIFY).unwrap());
-        assert!(db.record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl1").unwrap());
+        assert!(db
+            .record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl1")
+            .unwrap());
         assert!(db.already_synced(id, "pl1", PLATFORM_SPOTIFY).unwrap());
 
         // Second attempt is refused by the unique constraint, not by caller logic.
-        assert!(!db.record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl1").unwrap());
+        assert!(!db
+            .record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl1")
+            .unwrap());
         assert_eq!(db.counts().unwrap().2, 1);
 
         // A different playlist is a legitimate second push.
-        assert!(db.record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl2").unwrap());
+        assert!(db
+            .record_sync(id, PLATFORM_SPOTIFY, "spotify:track:1", "pl2")
+            .unwrap());
         assert_eq!(db.counts().unwrap().2, 2);
     }
 
@@ -539,8 +591,18 @@ mod tests {
         let found_id = db.upsert_track(&found).unwrap().id;
         let lost_id = db.upsert_track(&lost).unwrap().id;
 
-        db.record_match(found_id, PLATFORM_SPOTIFY, &outcome(Verdict::Auto, "spotify:track:1")).unwrap();
-        db.record_match(lost_id, PLATFORM_SPOTIFY, &outcome(Verdict::NoMatch, "spotify:track:2")).unwrap();
+        db.record_match(
+            found_id,
+            PLATFORM_SPOTIFY,
+            &outcome(Verdict::Auto, "spotify:track:1"),
+        )
+        .unwrap();
+        db.record_match(
+            lost_id,
+            PLATFORM_SPOTIFY,
+            &outcome(Verdict::NoMatch, "spotify:track:2"),
+        )
+        .unwrap();
 
         let missed = db.missed_tracks(PLATFORM_SPOTIFY).unwrap();
         assert_eq!(missed.len(), 1);
@@ -553,9 +615,16 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let t = track("/m/a.aiff", "Kolsch", "Grey", 400_000, None);
         let id = db.upsert_track(&t).unwrap().id;
-        db.record_match(id, PLATFORM_SPOTIFY, &outcome(Verdict::Auto, "spotify:track:1")).unwrap();
+        db.record_match(
+            id,
+            PLATFORM_SPOTIFY,
+            &outcome(Verdict::Auto, "spotify:track:1"),
+        )
+        .unwrap();
 
-        db.conn.execute("DELETE FROM tracks WHERE id = ?1", params![id]).unwrap();
+        db.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![id])
+            .unwrap();
         assert_eq!(db.counts().unwrap().1, 0, "orphaned match rows left behind");
     }
 }

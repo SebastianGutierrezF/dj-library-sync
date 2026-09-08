@@ -182,7 +182,9 @@ fn mix_score(local: &ParsedTitle, remote: &ParsedTitle, notes: &mut Vec<String>)
             return Some(0.35);
         }
         (Some(a), None) => {
-            notes.push(format!("local is a '{a}' version, candidate is not a remix"));
+            notes.push(format!(
+                "local is a '{a}' version, candidate is not a remix"
+            ));
             return Some(0.10);
         }
         (None, Some(b)) => {
@@ -271,8 +273,7 @@ pub fn same_recording_meta(
         _ => {}
     }
 
-    text_similarity(&a.base, &b.base) >= 0.92
-        && token_set_similarity(a_artists, b_artists) >= 0.80
+    text_similarity(&a.base, &b.base) >= 0.92 && token_set_similarity(a_artists, b_artists) >= 0.80
 }
 
 /// True when the candidate is confidently the same song but a materially
@@ -369,7 +370,10 @@ pub fn evaluate(
                 return MatchOutcome {
                     verdict: Verdict::Review,
                     method: MatchMethod::Isrc,
-                    candidates: vec![Candidate { track: track.clone(), score }],
+                    candidates: vec![Candidate {
+                        track: track.clone(),
+                        score,
+                    }],
                     reason: "isrc hit with implausible duration".to_string(),
                 };
             }
@@ -377,7 +381,10 @@ pub fn evaluate(
             return MatchOutcome {
                 verdict: Verdict::Auto,
                 method: MatchMethod::Isrc,
-                candidates: vec![Candidate { track: track.clone(), score }],
+                candidates: vec![Candidate {
+                    track: track.clone(),
+                    score,
+                }],
                 reason: "exact isrc".to_string(),
             };
         }
@@ -474,7 +481,11 @@ pub fn evaluate(
 
     MatchOutcome {
         verdict,
-        method: if verdict == Verdict::NoMatch { MatchMethod::None } else { method },
+        method: if verdict == Verdict::NoMatch {
+            MatchMethod::None
+        } else {
+            method
+        },
         candidates: scored,
         reason,
     }
@@ -560,7 +571,12 @@ mod tests {
 
     #[test]
     fn isrc_wins_immediately() {
-        let track = local("Kolsch", "Grey (Extended Mix)", 400_000, Some("DEUM71900123"));
+        let track = local(
+            "Kolsch",
+            "Grey (Extended Mix)",
+            400_000,
+            Some("DEUM71900123"),
+        );
         let mut hit = remote("Kolsch", "Grey - Extended Mix", 401_000);
         hit.isrc = Some("DEUM71900123".into());
 
@@ -572,7 +588,12 @@ mod tests {
 
     #[test]
     fn mistagged_isrc_with_wild_duration_goes_to_review() {
-        let track = local("Kolsch", "Grey (Extended Mix)", 400_000, Some("DEUM71900123"));
+        let track = local(
+            "Kolsch",
+            "Grey (Extended Mix)",
+            400_000,
+            Some("DEUM71900123"),
+        );
         let mut hit = remote("Someone Else", "Different Song", 120_000);
         hit.isrc = Some("DEUM71900123".into());
 
@@ -620,7 +641,11 @@ mod tests {
         let out = evaluate(&track, &[], &[short], Thresholds::default());
 
         assert_eq!(out.verdict, Verdict::Review);
-        assert!(out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+        assert!(
+            out.reason.contains("shorter cut"),
+            "reason was: {}",
+            out.reason
+        );
     }
 
     #[test]
@@ -633,7 +658,11 @@ mod tests {
 
         let out = evaluate(&track, &[], &[short], thresholds);
         assert_eq!(out.verdict, Verdict::Auto);
-        assert!(out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+        assert!(
+            out.reason.contains("shorter cut"),
+            "reason was: {}",
+            out.reason
+        );
     }
 
     #[test]
@@ -695,7 +724,11 @@ mod tests {
 
         let out = evaluate(&track, &[], &[variant], thresholds);
         assert_eq!(out.verdict, Verdict::Review);
-        assert!(!out.reason.contains("shorter cut"), "reason was: {}", out.reason);
+        assert!(
+            !out.reason.contains("shorter cut"),
+            "reason was: {}",
+            out.reason
+        );
     }
 
     #[test]
@@ -703,16 +736,24 @@ mod tests {
         // Real case: the playlist held OUT OF MY HEAD under one URI and the
         // matcher later picked a different listing of the identical recording.
         assert!(same_recording_meta(
-            "DONT BLINK", "OUT OF MY HEAD", 199_000,
-            "DONT BLINK", "OUT OF MY HEAD", 199_400,
+            "DONT BLINK",
+            "OUT OF MY HEAD",
+            199_000,
+            "DONT BLINK",
+            "OUT OF MY HEAD",
+            199_400,
         ));
     }
 
     #[test]
     fn a_dash_suffixed_listing_matches_its_bracketed_twin() {
         assert!(same_recording_meta(
-            "Robotman, Marshall Jefferson", "Do Da Doo (DJ Minx Extended Remix)", 400_000,
-            "Marshall Jefferson, Robotman", "Do Da Doo - DJ Minx Extended Remix", 400_000,
+            "Robotman, Marshall Jefferson",
+            "Do Da Doo (DJ Minx Extended Remix)",
+            400_000,
+            "Marshall Jefferson, Robotman",
+            "Do Da Doo - DJ Minx Extended Remix",
+            400_000,
         ));
     }
 
@@ -720,18 +761,30 @@ mod tests {
     fn different_cuts_are_not_treated_as_duplicates() {
         // Same song, radio vs extended: genuinely two things.
         assert!(!same_recording_meta(
-            "Kolsch", "Grey (Extended Mix)", 400_000,
-            "Kolsch", "Grey (Radio Edit)", 199_000,
+            "Kolsch",
+            "Grey (Extended Mix)",
+            400_000,
+            "Kolsch",
+            "Grey (Radio Edit)",
+            199_000,
         ));
         // Same length, different remixer.
         assert!(!same_recording_meta(
-            "Kolsch", "Grey (Adam Beyer Remix)", 400_000,
-            "Kolsch", "Grey (Charlotte de Witte Remix)", 400_000,
+            "Kolsch",
+            "Grey (Adam Beyer Remix)",
+            400_000,
+            "Kolsch",
+            "Grey (Charlotte de Witte Remix)",
+            400_000,
         ));
         // Same length and title, unrelated artist.
         assert!(!same_recording_meta(
-            "Kolsch", "Grey", 400_000,
-            "Taylor Swift", "Grey", 400_000,
+            "Kolsch",
+            "Grey",
+            400_000,
+            "Taylor Swift",
+            "Grey",
+            400_000,
         ));
     }
 

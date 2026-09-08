@@ -149,7 +149,10 @@ impl SpotifyClient {
             TokenSource::ClientCredentials {
                 client_id,
                 client_secret,
-            } => self.client_credentials_token(client_id, client_secret).await?,
+            } => {
+                self.client_credentials_token(client_id, client_secret)
+                    .await?
+            }
 
             TokenSource::User { config, store } => {
                 // Reading the OS credential store can block indefinitely on a
@@ -164,9 +167,8 @@ impl SpotifyClient {
                 let loaded = store.load();
                 nudge.abort();
 
-                let stored = loaded?.ok_or_else(|| {
-                    anyhow!("not signed in to Spotify — run `djls login` first")
-                })?;
+                let stored = loaded?
+                    .ok_or_else(|| anyhow!("not signed in to Spotify — run `djls login` first"))?;
 
                 // Refreshing persists any rotated refresh token, which is the
                 // whole reason this goes through the store rather than a
@@ -328,7 +330,12 @@ impl SpotifyClient {
 
             return Ok(parsed
                 .tracks
-                .map(|page| page.items.into_iter().filter_map(ApiTrack::into_track).collect())
+                .map(|page| {
+                    page.items
+                        .into_iter()
+                        .filter_map(ApiTrack::into_track)
+                        .collect()
+                })
                 .unwrap_or_default());
         }
     }
@@ -348,7 +355,12 @@ impl SpotifyClient {
     /// Text search. Tries the field-filtered form first because it is far more
     /// precise, then falls back to a loose query, since filters miss when the
     /// tag spells the artist differently from the catalogue.
-    pub async fn search_text(&self, artist: &str, title: &str, limit: u32) -> Result<Vec<SpotifyTrack>> {
+    pub async fn search_text(
+        &self,
+        artist: &str,
+        title: &str,
+        limit: u32,
+    ) -> Result<Vec<SpotifyTrack>> {
         let artist = artist.trim();
         let title = title.trim();
         if title.is_empty() {
@@ -386,7 +398,11 @@ impl SpotifyClient {
     /// even sees its own match in the top results. When the local file is
     /// extended/club-length, run a second query naming the mix explicitly and
     /// merge in whatever it turns up that the first query missed.
-    pub async fn search_for_track(&self, local: &LocalTrack, limit: u32) -> Result<Vec<SpotifyTrack>> {
+    pub async fn search_for_track(
+        &self,
+        local: &LocalTrack,
+        limit: u32,
+    ) -> Result<Vec<SpotifyTrack>> {
         let artist = local.primary_artist();
         let title = &local.parsed.base;
 
@@ -474,7 +490,10 @@ impl Playlist {
     }
 
     pub fn is_owned_by(&self, user_id: &str) -> bool {
-        self.owner.as_ref().map(|o| o.id == user_id).unwrap_or(false)
+        self.owner
+            .as_ref()
+            .map(|o| o.id == user_id)
+            .unwrap_or(false)
     }
 }
 
@@ -501,10 +520,7 @@ impl SpotifyClient {
             self.pace().await;
             let token = self.access_token().await?;
 
-            let mut req = self
-                .http
-                .request(method.clone(), url)
-                .bearer_auth(&token);
+            let mut req = self.http.request(method.clone(), url).bearer_auth(&token);
             if let Some(body) = &body {
                 req = req.json(body);
             }
@@ -561,7 +577,9 @@ impl SpotifyClient {
                          account must be listed under Settings -> User Management \
                          while the app is in development mode."
                     };
-                    return Err(anyhow!("Spotify refused the request ({status}): {text}\n{hint}"));
+                    return Err(anyhow!(
+                        "Spotify refused the request ({status}): {text}\n{hint}"
+                    ));
                 }
                 return Err(anyhow!("Spotify API error ({status}): {text}"));
             }
@@ -595,7 +613,8 @@ impl SpotifyClient {
 
     /// Every playlist the user can see, newest first as Spotify returns them.
     pub async fn list_playlists(&self) -> Result<Vec<Playlist>> {
-        self.get_all(format!("{API_BASE}/me/playlists?limit=50")).await
+        self.get_all(format!("{API_BASE}/me/playlists?limit=50"))
+            .await
     }
 
     /// `POST /users/{id}/playlists` was removed in February 2026 — creation is
@@ -645,9 +664,7 @@ impl SpotifyClient {
         let rows: Vec<Row> = self
             // No `fields` filter here on purpose: trimming the response has
             // silently dropped the very metadata the duplicate check needs.
-            .get_all(format!(
-                "{API_BASE}/playlists/{playlist_id}/items?limit=50"
-            ))
+            .get_all(format!("{API_BASE}/playlists/{playlist_id}/items?limit=50"))
             .await?;
 
         Ok(rows
@@ -675,7 +692,11 @@ impl SpotifyClient {
     }
 
     /// Add tracks, 100 per request. Returns how many were sent.
-    pub async fn add_tracks_to_playlist(&self, playlist_id: &str, uris: &[String]) -> Result<usize> {
+    pub async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        uris: &[String],
+    ) -> Result<usize> {
         if uris.is_empty() {
             return Ok(0);
         }
@@ -751,13 +772,15 @@ impl ApiTrack {
             artists: self.artists.into_iter().map(|a| a.name).collect(),
             album: self.album.map(|a| a.name).unwrap_or_default(),
             duration_ms: self.duration_ms,
-            isrc: self.external_ids.and_then(|e| e.isrc).map(|s| s.to_uppercase()),
+            isrc: self
+                .external_ids
+                .and_then(|e| e.isrc)
+                .map(|s| s.to_uppercase()),
             url: self.external_urls.and_then(|e| e.spotify),
             popularity: self.popularity,
         })
     }
 }
-
 
 #[async_trait::async_trait]
 impl crate::platform::MusicPlatform for SpotifyClient {

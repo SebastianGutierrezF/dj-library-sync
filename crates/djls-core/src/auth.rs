@@ -277,7 +277,11 @@ async fn exchange_code(config: &AuthConfig, code: &str, verifier: &str) -> Resul
 }
 
 /// Exchange a refresh token for a fresh access token, persisting any rotation.
-pub async fn refresh(config: &AuthConfig, store: &dyn TokenStore, current: &Tokens) -> Result<Tokens> {
+pub async fn refresh(
+    config: &AuthConfig,
+    store: &dyn TokenStore,
+    current: &Tokens,
+) -> Result<Tokens> {
     let http = reqwest::Client::new();
     let resp = http
         .post(TOKEN_URL)
@@ -309,8 +313,8 @@ pub async fn refresh(config: &AuthConfig, store: &dyn TokenStore, current: &Toke
 
 /// Parse `code` out of the OAuth redirect, rejecting a mismatched `state`.
 fn parse_callback(path: &str, expected_state: &str) -> Result<String> {
-    let url = reqwest::Url::parse(&format!("http://127.0.0.1{path}"))
-        .context("parsing redirect URL")?;
+    let url =
+        reqwest::Url::parse(&format!("http://127.0.0.1{path}")).context("parsing redirect URL")?;
 
     let mut code = None;
     let mut state = None;
@@ -365,7 +369,9 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
 
         let result = parse_callback(path, expected_state);
         let page = match &result {
-            Ok(_) => "<h2>Connected.</h2><p>You can close this tab and go back to the terminal.</p>",
+            Ok(_) => {
+                "<h2>Connected.</h2><p>You can close this tab and go back to the terminal.</p>"
+            }
             Err(_) => "<h2>Something went wrong.</h2><p>Check the terminal for details.</p>",
         };
         let body = format!(
@@ -429,7 +435,9 @@ mod tests {
         assert_ne!(a.verifier, b.verifier);
         assert_ne!(a.challenge, b.challenge);
         // Base64url must not contain characters needing escaping in a query.
-        assert!(!a.challenge.contains('+') && !a.challenge.contains('/') && !a.challenge.contains('='));
+        assert!(
+            !a.challenge.contains('+') && !a.challenge.contains('/') && !a.challenge.contains('=')
+        );
     }
 
     #[test]
@@ -500,7 +508,10 @@ mod tests {
             refresh_token: "r".into(),
             expires_at: now_unix() + 10,
         };
-        assert!(tokens.is_expired(), "a token expiring in 10s must refresh early");
+        assert!(
+            tokens.is_expired(),
+            "a token expiring in 10s must refresh early"
+        );
     }
 
     #[test]
