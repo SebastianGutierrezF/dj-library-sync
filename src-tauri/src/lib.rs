@@ -236,6 +236,42 @@ fn spotify_logout() -> Result<(), String> {
     KeyringStore::default().clear().map_err(|e| format!("{e:#}"))
 }
 
+/// What the connect screen needs to render each platform.
+#[derive(Serialize)]
+struct PlatformOption {
+    id: String,
+    display_name: String,
+    /// "user_provided" — the user registers their own developer app.
+    /// "hosted" — one-click sign-in against our developer account.
+    credentials: String,
+    metered: bool,
+    available: bool,
+    connected: bool,
+}
+
+#[tauri::command]
+async fn available_platforms() -> Vec<PlatformOption> {
+    use djls_core::platform::{CredentialModel, PlatformInfo};
+
+    let spotify_connected = account_status().await.signed_in;
+
+    PlatformInfo::ALL
+        .iter()
+        .map(|info| PlatformOption {
+            id: info.id.to_string(),
+            display_name: info.display_name.to_string(),
+            credentials: match info.credentials {
+                CredentialModel::UserProvided => "user_provided",
+                CredentialModel::Hosted => "hosted",
+            }
+            .to_string(),
+            metered: info.metered,
+            available: info.available,
+            connected: info.id == "spotify" && spotify_connected,
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn redirect_uri() -> Result<String, String> {
     Ok(auth_config()?.redirect_uri())
@@ -481,6 +517,7 @@ pub fn run() {
             load_config,
             save_config,
             account_status,
+            available_platforms,
             spotify_login,
             spotify_logout,
             redirect_uri,

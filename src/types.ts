@@ -115,3 +115,12 @@ export interface PushResult {
   added: number;
   skipped: number;
 }
+
+export interface PlatformOption {
+  id: string;
+  display_name: string;
+  credentials: "user_provided" | "hosted";
+  metered: boolean;
+  available: boolean;
+  connected: boolean;
+}

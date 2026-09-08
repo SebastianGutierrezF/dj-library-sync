@@ -9,6 +9,7 @@ import type {
   LocalTrack,
   MatchRow,
   MixKind,
+  PlatformOption,
   PlaylistInfo,
   PushResult,
 } from "./types";
@@ -38,6 +39,8 @@ export default function App() {
   const [account, setAccount] = useState<AccountStatus | null>(null);
   const [clientIdDraft, setClientIdDraft] = useState("");
   const [redirect, setRedirect] = useState<string>("");
+  const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
+  const [connecting, setConnecting] = useState<string | null>(null);
 
   const [rows, setRows] = useState<MatchRow[]>([]);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
@@ -52,6 +55,7 @@ export default function App() {
 
   const refreshAccount = useCallback(async () => {
     setAccount(await invoke<AccountStatus>("account_status"));
+    setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
 
   const [bootError, setBootError] = useState<string | null>(null);
@@ -213,26 +217,84 @@ export default function App() {
 
   if (!config) return <div className="app"><p className="dim">Loading…</p></div>;
 
-  // --- Onboarding ---------------------------------------------------------
-  if (!account?.configured) {
+  // --- Connect a service --------------------------------------------------
+  if (!account?.configured || !account?.signed_in) {
     return (
       <div className="app">
         <h1>DJ Library Sync</h1>
-        <div className="panel">
-          <h2>Connect a Spotify app</h2>
-          <p className="dim">
-            Create an app at developer.spotify.com/dashboard and paste its Client ID.
-            There is no secret to enter — this uses PKCE.
-          </p>
-          <div className="row">
-            <input
-              value={clientIdDraft}
-              onChange={(e) => setClientIdDraft(e.target.value)}
-              placeholder="Client ID"
-              spellCheck={false}
-            />
-            <button onClick={saveClientId} disabled={!clientIdDraft.trim()}>Save</button>
-          </div>
+        <p className="dim intro">Pick where your new downloads should end up.</p>
+
+        {error && <div className="banner error">{error}</div>}
+
+        <div className="services">
+          {platforms.map((p) => (
+            <div key={p.id} className={`service ${p.available ? "" : "soon"}`}>
+              <div className="service-head">
+                <div>
+                  <h2>{p.display_name}</h2>
+                  <p className="dim small">
+                    {!p.available
+                      ? "Coming soon"
+                      : p.credentials === "user_provided"
+                      ? "Free — uses your own developer app"
+                      : "One-click sign in"}
+                  </p>
+                </div>
+                {p.connected ? (
+                  <span className="pill good">connected</span>
+                ) : p.available ? (
+                  <button
+                    onClick={() =>
+                      setConnecting(connecting === p.id ? null : p.id)
+                    }
+                  >
+                    {connecting === p.id ? "Close" : "Connect"}
+                  </button>
+                ) : (
+                  <span className="pill">{p.metered ? "paid" : "free"}</span>
+                )}
+              </div>
+
+              {connecting === p.id && p.credentials === "user_provided" && (
+                <div className="setup">
+                  <p className="dim">
+                    Spotify only lets a developer app serve five people, so this one
+                    runs on an app you own. It takes about two minutes and it is free.
+                  </p>
+                  <ol className="dim">
+                    <li>
+                      Open <code>developer.spotify.com/dashboard</code> and create an app
+                    </li>
+                    <li>
+                      Add <code>{redirect || "http://127.0.0.1:8888/callback"}</code> as a
+                      Redirect URI — it must be the <code>127.0.0.1</code> form,
+                      Spotify rejects <code>localhost</code>
+                    </li>
+                    <li>Under Settings → User Management, add your own Spotify account</li>
+                    <li>Copy the Client ID and paste it below</li>
+                  </ol>
+                  <p className="dim small">
+                    Only the Client ID — never the secret. This uses PKCE, which is
+                    designed so desktop apps do not need one.
+                  </p>
+                  <div className="row">
+                    <input
+                      value={clientIdDraft}
+                      onChange={(e) => setClientIdDraft(e.target.value)}
+                      placeholder="Client ID"
+                      spellCheck={false}
+                    />
+                    <button
+                      onClick={account?.configured ? signIn : saveClientId}
+                      disabled={!account?.configured && !clientIdDraft.trim()}
+                    >
+                      {account?.configured ? "Sign in" : "Save"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       </div>
     );
@@ -263,16 +325,6 @@ export default function App() {
         <div className="banner good">
           Added {result.added} to “{result.playlist_name}”
           {result.skipped > 0 && ` · ${result.skipped} already there`}
-        </div>
-      )}
-
-      {!account.signed_in && (
-        <div className="panel">
-          <h2>Sign in to continue</h2>
-          <p className="dim">
-            Opens your browser. Make sure <code>{redirect}</code> is listed as a
-            redirect URI on your Spotify app.
-          </p>
         </div>
       )}
 

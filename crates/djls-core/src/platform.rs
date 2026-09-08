@@ -46,15 +46,42 @@ pub struct PlatformInfo {
     pub credentials: CredentialModel,
     /// Whether usage counts against a paid quota.
     pub metered: bool,
+    /// False for platforms that are announced but not yet implemented.
+    pub available: bool,
 }
 
 impl PlatformInfo {
     pub const SPOTIFY: PlatformInfo = PlatformInfo {
         id: "spotify",
         display_name: "Spotify",
+        // Spotify can only ever run on the user's own developer app, so it
+        // costs us nothing to serve and cannot be metered.
         credentials: CredentialModel::UserProvided,
         metered: false,
+        available: true,
     };
+
+    /// Not implemented yet. Listed so the connect screen can show what is
+    /// coming and which model each platform will use.
+    pub const APPLE_MUSIC: PlatformInfo = PlatformInfo {
+        id: "apple_music",
+        display_name: "Apple Music",
+        credentials: CredentialModel::Hosted,
+        metered: true,
+        available: false,
+    };
+
+    pub const TIDAL: PlatformInfo = PlatformInfo {
+        id: "tidal",
+        display_name: "TIDAL",
+        credentials: CredentialModel::Hosted,
+        metered: true,
+        available: false,
+    };
+
+    /// Everything the connect screen should offer, in display order.
+    pub const ALL: &'static [PlatformInfo] =
+        &[Self::SPOTIFY, Self::APPLE_MUSIC, Self::TIDAL];
 }
 
 /// What a streaming service has to do to be a sync target.
