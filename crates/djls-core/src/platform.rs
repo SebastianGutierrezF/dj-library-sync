@@ -63,6 +63,10 @@ impl PlatformInfo {
 
     /// Not implemented yet. Listed so the connect screen can show what is
     /// coming and which model each platform will use.
+    /// Apple Music supports both models — see `docs/apple-music-auth.md`.
+    /// Hosted is the default because signing developer tokens needs a private
+    /// key that cannot ship in an open-source app; users with their own Apple
+    /// Developer membership can supply a key instead and pay nothing.
     pub const APPLE_MUSIC: PlatformInfo = PlatformInfo {
         id: "apple_music",
         display_name: "Apple Music",
