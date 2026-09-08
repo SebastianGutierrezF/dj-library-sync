@@ -173,13 +173,15 @@ async fn main() -> Result<()> {
             };
             cmd_match(
                 &folder,
-                !no_recursive,
-                limit,
-                market,
-                csv,
-                shorter_version,
-                rescan,
-                verbose,
+                MatchOptions {
+                    recursive: !no_recursive,
+                    limit,
+                    market,
+                    csv_path: csv,
+                    shorter_version,
+                    rescan,
+                    verbose,
+                },
             )
             .await
         }
@@ -309,8 +311,9 @@ fn cmd_scan(folder: &Path, recursive: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_match(
-    folder: &Path,
+/// Grouped because eight positional arguments is an invitation to pass two of
+/// them in the wrong order.
+struct MatchOptions {
     recursive: bool,
     limit: Option<usize>,
     market: Option<String>,
@@ -318,7 +321,18 @@ async fn cmd_match(
     shorter_version: ShorterVersionPolicy,
     rescan: bool,
     verbose: bool,
-) -> Result<()> {
+}
+
+async fn cmd_match(folder: &Path, opts: MatchOptions) -> Result<()> {
+    let MatchOptions {
+        recursive,
+        limit,
+        market,
+        csv_path,
+        shorter_version,
+        rescan,
+        verbose,
+    } = opts;
     let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok().filter(|s| !s.is_empty());
     let client_secret = std::env::var("SPOTIFY_CLIENT_SECRET").ok().filter(|s| !s.is_empty());
 
@@ -510,7 +524,7 @@ async fn cmd_playlists() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<44} {:>7}  {}", "NAME", "TRACKS", "OWNER");
+    println!("{:<44} {:>7}  OWNER", "NAME", "TRACKS");
     println!("{}", "-".repeat(70));
     for p in &playlists {
         println!(
@@ -897,7 +911,7 @@ fn print_summary(rows: &[Row], client: &SpotifyClient) {
     if !miss_reasons.is_empty() {
         println!("\n  why tracks missed:");
         let mut reasons: Vec<_> = miss_reasons.into_iter().collect();
-        reasons.sort_by(|a, b| b.1.cmp(&a.1));
+        reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         for (reason, count) in reasons.into_iter().take(6) {
             println!("    {count:>4}  {}", truncate(&reason, 68));
         }

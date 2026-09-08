@@ -1,216 +1,151 @@
 # DJ Library Sync
 
-Watches a downloads folder, matches new tracks against Spotify, and pushes them
-to a playlist. This repo currently covers **Phase 0** (scaffold, folder watcher,
-tag extraction) and **Phase 0.5** (headless matcher + match-rate report).
+Watches the folder your music downloads land in, works out which tracks exist
+on a streaming service, and adds them to a playlist — so new records are on
+your phone before you've had time to sit down and listen to them.
 
-## Why the CLI exists
-
-The matcher is the make-or-break piece, so it is built headless and measurable
-first. Before writing any more UI, run `djls match` against your real downloads
-folder. That number — what percentage of your library actually resolves on
-Spotify — should decide how much further this project is worth taking.
-
-## Layout
+Built for DJs who buy from Beatport and similar stores, where a week's
+downloads pile up unheard because curating them takes an evening you don't
+have.
 
 ```
-crates/djls-core/    tags, normalization, matching, Spotify client, folder watcher
-crates/djls-cli/     `djls` — headless scan / match / watch
-src-tauri/           Tauri v2 desktop app (Phase 0 shell)
-src/                 React frontend
+31 tracks in ~/Downloads/Beatport
+
+  auto-push        29    93.5%
+  needs review      1     3.2%
+  no match          1     3.2%
 ```
 
-All logic lives in `djls-core`. The app and the CLI are both thin shells over
-it, so anything the matcher learns is shared by both.
+## What makes it work
 
-## Setup
+Matching a local file to a streaming catalogue sounds trivial and isn't. Three
+things do most of the heavy lifting:
 
-Rust and Node are both required.
+**Mix descriptors are parsed, never stripped.** `Track (Extended Mix)` and
+`Track (Radio Edit)` are different recordings. A matcher that strips the
+descriptor to "normalize" the title will match a 3-minute radio edit to your
+7-minute extended mix at 100% confidence, with nothing to warn you. Titles are
+split into a base name, a version kind, and a remixer, and each is scored
+separately.
+
+**Duration is a first-class signal.** It is what separates an extended mix from
+a radio edit when the strings are identical, and it is why an unlabelled
+candidate whose length lands within two seconds can still be trusted.
+
+**Not-found is a real answer.** Roughly a third of a typical Beatport folder
+exists on Spotify only as a shorter cut — the extended mix was never published.
+That is a decision, not an error, so it is a setting rather than a silent
+substitution.
+
+Verdicts are `auto` (push it), `review` (park it — it never blocks the batch),
+and `no_match` (logged for future audio fingerprinting).
+
+## Install
+
+Requires [Rust](https://rustup.rs) and [Node](https://nodejs.org) 18+.
 
 ```bash
-cd ~/dj-library-sync && cargo build
+git clone https://github.com/<owner>/dj-library-sync
+cd dj-library-sync
+cargo build --release
+npm install
 ```
 
-Run the tests with `cargo test -p djls-core -p djls-cli` rather than a bare
-`cargo test` — the workspace includes the Tauri app, and linking it makes a
-full-workspace test run take minutes for no benefit.
+## Connecting Spotify
 
-```bash
-npm install --cache ~/.npm-cache-cc
-```
+Spotify limits any one developer app to **five users**, and extended access is
+open only to organisations with 250k+ monthly actives. There is no way to ship
+a shared Spotify app, so this one runs on an app *you* own. It is free and
+takes a couple of minutes.
 
-## The CLI
+1. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
+2. Add `http://127.0.0.1:8888/callback` as a Redirect URI — it must be the
+   `127.0.0.1` form, Spotify rejects `localhost`
+3. Under Settings → User Management, add your own Spotify account
+4. Copy the Client ID into the app, or into `.env` for the CLI
 
-```bash
-cargo run -p djls-cli -- scan ~/Downloads/Beatport
-```
+You need Spotify **Premium**: development-mode apps stop working without it.
 
-Reads tags and shows how each title parses — artist, base title, version
-descriptor, length, and whether an ISRC is present. No network.
+Only the Client ID is ever requested. This uses PKCE, which exists so that
+desktop apps don't need a client secret — and a secret stored on a user's
+machine isn't secret anyway.
 
-```bash
-cargo run -p djls-cli -- match ~/Downloads/Beatport --csv report.csv
-```
+## Using it
 
-Matches against Spotify and prints the hit rate: auto-push / needs review /
-no match, broken down by match method, with the reasons tracks missed.
-
-Needs credentials — copy `.env.example` to `.env` and fill in a client ID and
-secret from https://developer.spotify.com/dashboard. This command uses the
-Client Credentials flow, so no redirect URI and no user account are involved.
-
-Useful flags: `--limit 100` for a fast read on a huge folder, `--market GB` to
-count only what is actually available in your country, `--accept-shorter` /
-`--reject-shorter` to set the shorter-cut policy, `--verbose` for per-track
-output.
-
-```bash
-cargo run -p djls-cli -- watch ~/Downloads/Beatport
-cargo run -p djls-cli -- parse "Grey (Adam Beyer's Extended Remix)"
-```
-
-## Connecting your account
-
-Register `http://127.0.0.1:8888/callback` as a redirect URI on your Spotify app
-first — Spotify only validates it *after* you log in, so a missing entry shows
-up as a confusing failure at the end of the flow rather than the start.
-
-```bash
-cargo run -p djls-cli -- login
-```
-
-Opens your browser, and stores the tokens in your OS keychain — never in a file.
-`--no-browser` prints the URL instead, for SSH sessions. Then `djls whoami` to
-confirm, `djls logout` to disconnect.
-
-Note that a development-mode app only works for accounts on its allowlist in the
-developer dashboard.
-
-## Pushing to a playlist
-
-```bash
-cargo run -p djls-cli -- push ~/Downloads/Beatport --dry-run
-cargo run -p djls-cli -- push ~/Downloads/Beatport --playlist "Gym" --accept-shorter
-```
-
-Only `auto` verdicts get pushed — anything needing review waits for you, which
-is the point of the split. The target playlist is created if it doesn't exist
-(default name: `New Downloads <today>`), tracks already in it are skipped so a
-re-run never stacks duplicates, and it asks before writing unless you pass `-y`.
-
-## Local state
-
-Matches and pushes are recorded in SQLite at
-`~/Library/Application Support/dj-library-sync/library.db` (platform data dir
-elsewhere), so a second run over the same folder costs no API calls at all.
-
-```bash
-cargo run -p djls-cli -- stats     # what the database holds
-cargo run -p djls-cli -- misses    # tracks with no match — the AcoustID queue
-```
-
-Identity is not the file path. Rekordbox and Serato rewrite tags on import and
-DJs move files between folders; a moved file keeps its history and a re-tagged
-one is re-matched. Two schema-level guarantees do the work that caller logic
-would otherwise have to get right every time:
-
-- `matches` is unique per `(track_id, platform)` — re-matching updates in place.
-- `sync_log` is unique per `(track_id, playlist_id, platform)` — pushing the
-  same track to the same playlist twice is impossible.
-
-Pass `--rescan` to `match` or `push` to re-query Spotify anyway.
-
-## The app
-
-
+The desktop app watches a folder and gives you a dashboard, a review list and a
+playlist picker:
 
 ```bash
 npm run tauri dev
 ```
 
-Pick a folder; it scans what is there and then watches for new arrivals. Files
-are only read once their size has held steady, so partial downloads are never
-parsed.
+Everything is also available headless:
 
-## Matching design
+```bash
+djls match ~/Downloads/Beatport --csv report.csv   # hit rate + per-track report
+djls push  ~/Downloads/Beatport --accept-shorter   # add confident matches
+djls misses                                        # tracks found nowhere
+djls stats                                         # what the database holds
+```
 
-Four signals, weighted: artist `0.32`, base title `0.30`, duration `0.24`, mix
-agreement `0.14`. Thresholds live in `Thresholds` in `matcher.rs`.
+`--accept-shorter` pushes the shorter cut when the extended mix isn't
+published. On a real 31-track library that moved auto-push from 56% to 85%,
+because it collapses eight separate judgement calls into one preference.
 
-Two decisions worth knowing about:
+## How it fits together
 
-**Mix descriptors are parsed into a field, never stripped.** `Track (Extended
-Mix)` and `Track (Radio Edit)` are different recordings. Stripping the
-descriptor makes a 3-minute radio edit match a 7-minute extended mix at 100%
-confidence, with no signal that anything is wrong. Instead the title splits into
-`base` + `kind` + `remixer`, and the descriptor is scored separately.
+```
+crates/djls-core/    tags, normalization, matching, database, watcher, platforms
+crates/djls-cli/     djls — headless matcher, and how the matcher gets measured
+src-tauri/ + src/    Tauri v2 desktop app
+```
 
-**Duration is a first-class signal.** It is what resolves extended-vs-original
-when the strings are identical, and it is why an unlabelled Spotify candidate
-whose length lands within 2s of the local file can still be auto-pushed. A
-different remixer is a hard reject regardless of string similarity.
+All logic lives in `djls-core`. The CLI and the app are thin shells over it, so
+anything the matcher learns is shared by both — and the matcher can be measured
+against a real library without any UI existing.
 
-Verdicts are `auto` (push it), `review` (park it — never block the batch), and
-`no_match` (the future AcoustID queue).
+Local state lives in SQLite, so a second run over the same folder costs no API
+calls. Identity is not the file path: Rekordbox and Serato rewrite tags on
+import and DJs move files between folders, so a moved file keeps its history
+while a genuinely re-tagged one is matched again.
 
-**Shorter cuts.** The most common real outcome is that Spotify has the right
-song but only a shorter cut of it — the extended mix was never published.
-`ShorterVersionPolicy` decides what happens then: `Review` (default), `Accept`
-(push the shorter version), or `Reject` (treat as no match). It only applies
-when artist and title both score above the auto thresholds and the candidate is
-at least 20s shorter, so it reframes a length disagreement and never rescues a
-doubtful identity.
+## Adding a streaming service
 
-## Measured on a real library
+Implement `MusicPlatform` in `crates/djls-core/src/platform.rs`. Nothing above
+the client is platform-specific, so a new service does not touch the matcher.
 
-27 tracks from a Beatport downloads folder, 0 search errors:
+`CredentialModel` records whether a platform can be served from one developer
+account (`Hosted`, one-click sign-in) or requires each user to register their
+own (`UserProvided`, as Spotify does). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-| | default | `--accept-shorter` |
-|---|---|---|
-| auto-push | 15 (56%) | 23 (85%) |
-| needs review | 11 (41%) | 3 (11%) |
-| no match | 1 (4%) | 1 (4%) |
+## Spotify's February 2026 Development Mode changes
 
-96% of the library exists on Spotify, but only 67% of matches agree on length
-within 5s. Of 6 local extended mixes, only 2 had their extended cut published;
-the other 4 were verified by hand to be genuinely absent, not a search failure.
-So availability is not the constraint — version fidelity is, and the whole
-review queue collapses to one repeated question: accept the shorter cut or not.
-
-## Not yet built
-
-Phase 2 onward: SQLite state (so a re-run doesn't re-match files it has already
-seen), the review screen, and the push flow wired into the desktop app with a
-completion notification. Auth and playlist push exist only in the CLI so far.
-
-## Development Mode constraints (February 2026 changes)
-
-Spotify [reduced Development Mode](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security)
-in February 2026, and this app is built against the reduced surface. The
+Development Mode lost a lot of surface area, and this app targets the reduced
+set. The
 [migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
-is the authoritative list; what bites this project:
+is authoritative; what affects this project:
 
-| Removed / changed | Used here as |
+| Changed | Used here as |
 |---|---|
 | `POST /users/{id}/playlists` removed | `POST /me/playlists` |
-| `POST /playlists/{id}/tracks` | `POST /playlists/{id}/items` |
-| `GET /playlists/{id}/tracks` | `GET /playlists/{id}/items` |
+| `POST\|GET /playlists/{id}/tracks` | `/playlists/{id}/items` |
 | playlist `tracks` field renamed | `items` (entries carry `item`, not `track`) |
-| search `limit` max 50 → **10** | clamped in the client; widen with extra queries |
+| search `limit` max 50 → **10** | clamped; widened with extra queries |
 | `GET /me` drops `country`, `product` | not relied on |
-| track `popularity` dropped | optional, unused for scoring |
 
-Calling a removed endpoint returns a bare `403 Forbidden` — not a scope error,
-and not something a dashboard setting can fix. `"Insufficient client scope"` is
-the genuinely scope-related 403; the two need opposite fixes.
+**A removed endpoint returns a bare `403 Forbidden`** — not a scope error, and
+nothing a dashboard setting can fix. `"Insufficient client scope"` is the
+genuinely scope-related 403. The two look alike and need opposite fixes; this
+cost a full debugging session to learn.
 
-Also required in Development Mode: the app owner must have **Spotify Premium**,
-and each user must be listed under Settings → User Management (max 5).
+## Status
 
-Two things to settle before Phase 1:
+Working: folder watching, tag extraction, matching, review, Spotify auth and
+playlist push, local state.
 
-- **Spotify app quota.** New apps are limited to a small allowlist of users.
-  Shipping to anyone else needs an extended-quota request that Spotify reviews.
-  Irrelevant for personal use; decisive if this becomes a product.
-- **Refresh-token rotation.** Spotify's PKCE flow can return a new refresh token
-  on every refresh. Persist it each time or auth dies silently after a while.
+Not built yet: Apple Music and TIDAL adapters, audio fingerprinting for the
+no-match queue, background sync with notifications.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

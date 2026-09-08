@@ -695,7 +695,7 @@ impl SpotifyClient {
 }
 
 fn escape(input: &str) -> String {
-    input.replace('"', " ").replace('\\', " ")
+    input.replace(['"', '\\'], " ")
 }
 
 #[derive(Deserialize)]
