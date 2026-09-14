@@ -19,10 +19,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # One universal macOS build rather than two architecture-specific
+          # ones. A browser cannot tell Apple Silicon from Intel — both report
+          # the same user agent — so a download page otherwise has to guess or
+          # ask. Building universal removes the question instead of working
+          # around it, and halves the macOS jobs.
           - os: macos-latest
-            args: "--target aarch64-apple-darwin"
-          - os: macos-latest
-            args: "--target x86_64-apple-darwin"
+            args: "--target universal-apple-darwin"
           - os: ubuntu-latest
             args: ""
           - os: windows-latest
