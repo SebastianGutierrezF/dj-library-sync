@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "dj-library-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "djls-core",
  "serde",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "djls-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "djls-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
