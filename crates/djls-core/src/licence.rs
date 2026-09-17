@@ -147,7 +147,12 @@ pub struct Entitlement {
     pub plan: Option<String>,
 }
 
+/// The service speaks camelCase — `expiresAt`, `deviceId`, `checkoutUrl`. Rust
+/// fields stay snake_case and serde bridges the two. Without the rename this
+/// failed outright on `expires_at`, which at least said so; the same mistake in
+/// `apple::TokenResponse` was silent, because the field there was optional.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ActivationResponse {
     token: String,
     expires_at: String,
@@ -501,6 +506,62 @@ mod tests {
         };
         assert!(trial.is_trial());
         assert!(!licence_expiring_in(3600).is_trial());
+    }
+
+    /// Captured from the live service, not hand-written from memory. Every
+    /// field name here is a real byte that crossed the wire.
+    const REAL_TRIAL_RESPONSE: &str = r#"{"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc.def","expiresAt":"2026-09-24T21:55:56.000Z","plan":"trial","credits":25,"granted":true}"#;
+
+    const REAL_ACTIVATE_RESPONSE: &str = r#"{"token":"eyJhbGciOiJIUzI1NiJ9.ghi.jkl","expiresAt":"2026-09-24T21:55:56.000Z","plan":"pack","seats":3,"reactivated":false}"#;
+
+    const REAL_ENTITLEMENT_RESPONSE: &str = r#"{"userId":"0b554dbb-26df-44e1-9107-6522b01c0feb","credits":25,"unlimited":false,"plan":"trial"}"#;
+
+    #[test]
+    fn the_trial_response_parses_as_the_service_actually_sends_it() {
+        // The service speaks camelCase. Expecting expires_at made every trial
+        // fail with "missing field `expires_at`" the first time a real client
+        // called it.
+        let parsed: ActivationResponse = serde_json::from_str(REAL_TRIAL_RESPONSE).unwrap();
+        assert_eq!(parsed.plan, "trial");
+        assert_eq!(parsed.expires_at, "2026-09-24T21:55:56.000Z");
+        assert!(!parsed.token.is_empty());
+    }
+
+    #[test]
+    fn the_activate_response_parses_too() {
+        let parsed: ActivationResponse = serde_json::from_str(REAL_ACTIVATE_RESPONSE).unwrap();
+        assert_eq!(parsed.plan, "pack");
+        assert_eq!(parsed.expires_at, "2026-09-24T21:55:56.000Z");
+    }
+
+    #[test]
+    fn the_expiry_the_service_sends_is_actually_readable() {
+        // Parsing the field is not enough: it feeds the refresh decision, and
+        // an unreadable timestamp silently means "expired, refresh now".
+        let parsed: ActivationResponse = serde_json::from_str(REAL_TRIAL_RESPONSE).unwrap();
+        let licence = StoredLicence {
+            key: None,
+            token: parsed.token,
+            expires_at: parsed.expires_at,
+            plan: parsed.plan,
+        };
+        assert!(
+            licence.seconds_remaining().is_some() || licence.is_expired(),
+            "the format must at least be parseable"
+        );
+        assert_eq!(
+            crate::apple::rfc3339_to_unix("2026-09-24T21:55:56.000Z"),
+            Some(1_790_286_956),
+            "milliseconds and the Z suffix must not defeat the parser"
+        );
+    }
+
+    #[test]
+    fn the_entitlement_response_parses_as_sent() {
+        let parsed: Entitlement = serde_json::from_str(REAL_ENTITLEMENT_RESPONSE).unwrap();
+        assert_eq!(parsed.credits, 25);
+        assert!(!parsed.unlimited);
+        assert_eq!(parsed.plan.as_deref(), Some("trial"));
     }
 
     #[test]

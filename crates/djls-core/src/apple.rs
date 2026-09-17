@@ -170,9 +170,16 @@ impl AppleClient {
         }
 
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct TokenResponse {
             token: String,
             /// RFC 3339. Only used to decide when to ask again.
+            ///
+            /// Optional, so a missing value falls back rather than failing —
+            /// which is exactly why the camelCase mismatch here went unnoticed
+            /// while the same bug in `licence` announced itself. Every token
+            /// was being cached for the default hour regardless of what the
+            /// service said.
             #[serde(default)]
             expires_at: Option<String>,
         }
