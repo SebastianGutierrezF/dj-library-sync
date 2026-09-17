@@ -379,7 +379,12 @@ fn parse_rfc3339_secs_from_now(value: &str) -> Option<Duration> {
 
 /// Parse `YYYY-MM-DDTHH:MM:SS` (with optional fraction and `Z`) to a Unix
 /// timestamp. Only UTC is accepted, which is all our service emits.
-fn rfc3339_to_unix(value: &str) -> Option<i64> {
+///
+/// Shared with `licence`, which needs the same arithmetic for activation-token
+/// expiry. Kept here rather than promoted to its own module: two callers is
+/// not yet a reason to invent a `time` module, and a real date-time dependency
+/// would be out of proportion to reading one field.
+pub(crate) fn rfc3339_to_unix(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 19 {
         return None;

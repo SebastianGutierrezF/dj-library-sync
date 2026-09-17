@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
 use djls_core::config::Config;
 use djls_core::db::{Database, PLATFORM_SPOTIFY};
+use djls_core::licence;
 use djls_core::matcher::{evaluate, Candidate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::spotify::SpotifyClient;
 use djls_core::tags::{scan_folder, LocalTrack};
@@ -241,6 +242,197 @@ fn spotify_logout() -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+// ---------------------------------------------------------------------------
+// Licence and Apple Music
+// ---------------------------------------------------------------------------
+
+/// Everything the licence panel renders.
+#[derive(Serialize, Default)]
+struct LicenceStatus {
+    /// True once this machine holds an activation token of any kind.
+    active: bool,
+    /// "trial" | "pack" | "unlimited"
+    plan: Option<String>,
+    credits: Option<i64>,
+    unlimited: bool,
+    expires_at: Option<String>,
+    /// Present only for a purchase — a trial has no key to show.
+    has_key: bool,
+    apple_connected: bool,
+    /// Shown as a warning, not a failure: Spotify keeps working regardless.
+    error: Option<String>,
+}
+
+fn device_id() -> Result<String, String> {
+    let mut config = Config::load();
+    config.device_id_or_create().map_err(|e| format!("{e:#}"))
+}
+
+fn service() -> Result<licence::ServiceClient, String> {
+    licence::ServiceClient::new(licence::service_url()).map_err(|e| format!("{e:#}"))
+}
+
+/// Read the stored licence, refreshing its token if it is near expiry.
+///
+/// Refresh failures are swallowed on purpose: a stale-but-valid token still
+/// works, and an outage must not lock someone out of a licence they paid for.
+async fn current_licence() -> Result<Option<licence::StoredLicence>, String> {
+    let store = licence::LicenceKeyring::default();
+    let Some(stored) = store.load().map_err(|e| format!("{e:#}"))? else {
+        return Ok(None);
+    };
+
+    if stored.needs_refresh() {
+        if let (Ok(client), Ok(device)) = (service(), device_id()) {
+            match client.refresh_if_needed(&stored, &device).await {
+                Ok(Some(fresh)) => {
+                    let _ = store.save(&fresh);
+                    return Ok(Some(fresh));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    // Worth knowing about, not worth failing over.
+                    eprintln!("[licence] refresh failed, using the stored token: {err:#}");
+                }
+            }
+        }
+    }
+
+    Ok(Some(stored))
+}
+
+#[tauri::command]
+async fn licence_status() -> LicenceStatus {
+    let apple_connected = licence::AppleTokenKeyring::default()
+        .load()
+        .ok()
+        .flatten()
+        .is_some();
+
+    let stored = match current_licence().await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return LicenceStatus {
+                apple_connected,
+                ..Default::default()
+            }
+        }
+        Err(err) => {
+            return LicenceStatus {
+                apple_connected,
+                error: Some(err),
+                ..Default::default()
+            }
+        }
+    };
+
+    let mut status = LicenceStatus {
+        active: !stored.is_expired(),
+        plan: Some(stored.plan.clone()),
+        expires_at: Some(stored.expires_at.clone()),
+        has_key: stored.key.is_some(),
+        apple_connected,
+        ..Default::default()
+    };
+
+    // The balance is worth showing but not worth blocking on.
+    match service() {
+        Ok(client) => match client.entitlement(&stored.token).await {
+            Ok(ent) => {
+                status.credits = Some(ent.credits);
+                status.unlimited = ent.unlimited;
+            }
+            Err(err) => status.error = Some(format!("{err:#}")),
+        },
+        Err(err) => status.error = Some(err),
+    }
+
+    status
+}
+
+#[tauri::command]
+async fn start_trial() -> Result<LicenceStatus, String> {
+    let client = service()?;
+    let device = device_id()?;
+
+    let licence = client
+        .start_trial(&device)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    licence::LicenceKeyring::default()
+        .save(&licence)
+        .map_err(|e| format!("{e:#}"))?;
+
+    Ok(licence_status().await)
+}
+
+#[tauri::command]
+async fn activate_licence(key: String) -> Result<LicenceStatus, String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("Paste your licence key first.".to_string());
+    }
+
+    let client = service()?;
+    let device = device_id()?;
+
+    let licence = client
+        .activate(&key, &device)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    licence::LicenceKeyring::default()
+        .save(&licence)
+        .map_err(|e| format!("{e:#}"))?;
+
+    Ok(licence_status().await)
+}
+
+#[tauri::command]
+fn clear_licence() -> Result<(), String> {
+    // Deliberately leaves the Apple connection alone: they are separate
+    // credentials, revoked independently.
+    licence::LicenceKeyring::default()
+        .clear()
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn apple_login(app: AppHandle) -> Result<LicenceStatus, String> {
+    let stored = current_licence()
+        .await?
+        .ok_or_else(|| "Start a trial or enter a licence key first.".to_string())?;
+
+    let token = licence::connect_apple_music(
+        &licence::service_url(),
+        &stored.token,
+        licence::APPLE_CALLBACK_PORT,
+        |url| {
+            // Apple's consent screen belongs in the user's real browser, where
+            // they may already be signed in — the same reasoning as Spotify.
+            if !auth::open_in_browser(url) {
+                let _ = app.emit("auth-url", url.to_string());
+            }
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+
+    licence::AppleTokenKeyring::default()
+        .save(&token)
+        .map_err(|e| format!("{e:#}"))?;
+
+    Ok(licence_status().await)
+}
+
+#[tauri::command]
+fn apple_logout() -> Result<(), String> {
+    licence::AppleTokenKeyring::default()
+        .clear()
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// What the connect screen needs to render each platform.
 #[derive(Serialize)]
 struct PlatformOption {
@@ -259,6 +451,8 @@ async fn available_platforms() -> Vec<PlatformOption> {
     use djls_core::platform::{CredentialModel, PlatformInfo};
 
     let spotify_connected = account_status().await.signed_in;
+    let apple = licence_status().await;
+    let apple_ready = apple.active && apple.apple_connected;
 
     PlatformInfo::ALL
         .iter()
@@ -272,7 +466,13 @@ async fn available_platforms() -> Vec<PlatformOption> {
             .to_string(),
             metered: info.metered,
             available: info.available,
-            connected: info.id == "spotify" && spotify_connected,
+            connected: match info.id {
+                "spotify" => spotify_connected,
+                // Apple needs both a licence and a Music User Token; either
+                // alone cannot reach the API.
+                "apple_music" => apple_ready,
+                _ => false,
+            },
         })
         .collect()
 }
@@ -531,7 +731,13 @@ pub fn run() {
             redirect_uri,
             match_folder,
             list_playlists,
-            push_tracks
+            push_tracks,
+            licence_status,
+            start_trial,
+            activate_licence,
+            clear_licence,
+            apple_login,
+            apple_logout
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJ Library Sync");

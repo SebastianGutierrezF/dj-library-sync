@@ -124,3 +124,17 @@ export interface PlatformOption {
   available: boolean;
   connected: boolean;
 }
+
+/** The licence this machine holds, and whether Apple Music is connected. */
+export interface LicenceStatus {
+  active: boolean;
+  plan: string | null;
+  credits: number | null;
+  unlimited: boolean;
+  expires_at: string | null;
+  /** False for a trial, which has no key to show. */
+  has_key: boolean;
+  apple_connected: boolean;
+  /** A warning, not a failure — Spotify keeps working regardless. */
+  error: string | null;
+}

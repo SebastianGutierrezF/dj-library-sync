@@ -8,6 +8,7 @@ pub mod apple;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod licence;
 pub mod matcher;
 pub mod normalize;
 pub mod platform;

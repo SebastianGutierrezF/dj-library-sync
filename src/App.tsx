@@ -10,6 +10,7 @@ import type {
   LocalTrack,
   MatchRow,
   MixKind,
+  LicenceStatus,
   PlatformOption,
   PlaylistInfo,
   PushResult,
@@ -42,6 +43,10 @@ export default function App() {
   const [redirect, setRedirect] = useState<string>("");
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
   const [connecting, setConnecting] = useState<string | null>(null);
+  const [licence, setLicence] = useState<LicenceStatus | null>(null);
+  const [licenceDraft, setLicenceDraft] = useState("");
+  const [licenceBusy, setLicenceBusy] = useState(false);
+  const [licenceError, setLicenceError] = useState<string | null>(null);
   /** Files the watcher has seen land since the last match. */
   const [pending, setPending] = useState<string[]>([]);
 
@@ -61,6 +66,32 @@ export default function App() {
     setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
 
+  const refreshLicence = useCallback(async () => {
+    try {
+      setLicence(await invoke<LicenceStatus>("licence_status"));
+    } catch (err) {
+      // Never fatal: the whole free tier works without a licence.
+      setLicenceError(String(err));
+    }
+  }, []);
+
+  /** Run a licence action, surfacing its error without taking the app down. */
+  const licenceAction = useCallback(
+    async (run: () => Promise<LicenceStatus>) => {
+      setLicenceBusy(true);
+      setLicenceError(null);
+      try {
+        setLicence(await run());
+        await refreshAccount();
+      } catch (err) {
+        setLicenceError(String(err));
+      } finally {
+        setLicenceBusy(false);
+      }
+    },
+    [refreshAccount],
+  );
+
   const [bootError, setBootError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -75,6 +106,10 @@ export default function App() {
           /* no client id yet */
         }
         await refreshAccount();
+        // Deliberately after refreshAccount and not awaited into the same
+        // failure path: the token service being unreachable must not stop the
+        // free Spotify tier from starting.
+        void refreshLicence();
       } catch (err) {
         // Without this the window sits on "Loading…" forever with no clue why.
         setBootError(String(err));
@@ -97,7 +132,7 @@ export default function App() {
       void unlistenProgress.then((fn) => fn());
       void unlistenDetected.then((fn) => fn());
     };
-  }, [refreshAccount]);
+  }, [refreshAccount, refreshLicence]);
 
   const persist = useCallback(async (next: AppConfig) => {
     setConfig(next);
@@ -305,6 +340,100 @@ export default function App() {
                       {account?.configured ? "Sign in" : "Save"}
                     </button>
                   </div>
+                </div>
+              )}
+
+              {connecting === p.id && p.credentials === "hosted" && (
+                <div className="setup">
+                  {!licence?.active ? (
+                    <>
+                      <p className="dim">
+                        Apple Music needs a developer token signed with a key that
+                        cannot ship inside an open-source app, so this one runs
+                        through our service. Start with 25 free tracks — no card,
+                        no account.
+                      </p>
+                      <div className="row">
+                        <button
+                          onClick={() =>
+                            licenceAction(() => invoke<LicenceStatus>("start_trial"))
+                          }
+                          disabled={licenceBusy}
+                        >
+                          {licenceBusy ? "Working…" : "Start free trial"}
+                        </button>
+                      </div>
+                      <p className="dim small">Already bought a licence?</p>
+                      <div className="row">
+                        <input
+                          value={licenceDraft}
+                          onChange={(e) => setLicenceDraft(e.target.value)}
+                          placeholder="DJLS-XXXX-XXXX-XXXX-XXXX"
+                          spellCheck={false}
+                        />
+                        <button
+                          onClick={() =>
+                            licenceAction(() =>
+                              invoke<LicenceStatus>("activate_licence", {
+                                key: licenceDraft,
+                              }),
+                            )
+                          }
+                          disabled={licenceBusy || !licenceDraft.trim()}
+                        >
+                          Activate
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="dim">
+                        {licence.unlimited
+                          ? "Unlimited plan."
+                          : `${licence.credits ?? 0} track${
+                              licence.credits === 1 ? "" : "s"
+                            } left on your ${licence.plan ?? "licence"}.`}
+                      </p>
+                      {!licence.apple_connected ? (
+                        <>
+                          <p className="dim small">
+                            Signing in opens Apple's page in your browser. Apple only
+                            issues the token needed here through a web page, so there
+                            is no way to do it inside the app.
+                          </p>
+                          <div className="row">
+                            <button
+                              onClick={() =>
+                                licenceAction(() => invoke<LicenceStatus>("apple_login"))
+                              }
+                              disabled={licenceBusy}
+                            >
+                              {licenceBusy ? "Waiting for Apple…" : "Sign in to Apple Music"}
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="row">
+                          <span className="pill good">Apple Music connected</span>
+                          <button
+                            className="ghost"
+                            onClick={async () => {
+                              await invoke("apple_logout");
+                              await refreshLicence();
+                              await refreshAccount();
+                            }}
+                          >
+                            Disconnect
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {licenceError && <p className="dim small warn">{licenceError}</p>}
+                  {licence?.error && !licenceError && (
+                    <p className="dim small warn">{licence.error}</p>
+                  )}
                 </div>
               )}
             </div>

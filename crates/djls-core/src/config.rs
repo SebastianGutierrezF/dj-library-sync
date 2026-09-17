@@ -23,9 +23,30 @@ pub struct Config {
     pub accept_shorter: bool,
     /// Playlist the last push went to, offered as the default next time.
     pub last_playlist: Option<String>,
+    /// Identifies this machine to the token service, for trial metering and
+    /// seat counting. Not a secret — it is an identifier, and someone editing
+    /// it to claim a second trial is a threat we deliberately do not defend
+    /// against, because a trial costs nothing to serve.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl Config {
+    /// This machine's id, generating and persisting one on first use.
+    pub fn device_id_or_create(&mut self) -> Result<String> {
+        if let Some(existing) = self.device_id.as_ref().filter(|id| id.len() >= 8) {
+            return Ok(existing.clone());
+        }
+
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("generating a device id: {e}"))?;
+        let id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        self.device_id = Some(id.clone());
+        self.save()?;
+        Ok(id)
+    }
+
     pub fn path() -> PathBuf {
         crate::db::Database::default_path()
             .parent()
@@ -82,6 +103,7 @@ mod tests {
             watch_folder: Some(PathBuf::from("/music/new")),
             accept_shorter: true,
             last_playlist: Some("Gym".into()),
+            device_id: Some("0123456789abcdef".into()),
         };
         cfg.save_to(&path).unwrap();
 
@@ -89,6 +111,22 @@ mod tests {
         assert_eq!(loaded.spotify_client_id.as_deref(), Some("abc123"));
         assert_eq!(loaded.watch_folder, Some(PathBuf::from("/music/new")));
         assert!(loaded.accept_shorter);
+        assert_eq!(loaded.device_id.as_deref(), Some("0123456789abcdef"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_written_before_device_ids_existed_still_loads() {
+        let dir = std::env::temp_dir().join(format!("djls-cfg-old-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"spotify_client_id":"abc","accept_shorter":false}"#).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.spotify_client_id.as_deref(), Some("abc"));
+        assert!(loaded.device_id.is_none(), "an absent id is generated on first use");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

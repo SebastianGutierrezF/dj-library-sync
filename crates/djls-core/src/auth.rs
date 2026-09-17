@@ -29,7 +29,7 @@ pub const REQUIRED_SCOPES: &[&str] = &[
 ];
 
 /// How long to wait for the user to finish the consent screen.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tokens {
@@ -78,6 +78,35 @@ impl KeyringStore {
     fn entry(&self) -> Result<keyring::Entry> {
         keyring::Entry::new(&self.service, &self.account).context("opening OS credential store")
     }
+
+    /// Read whatever JSON is stored under this entry.
+    ///
+    /// The credential store holds more than Spotify tokens now — a licence, a
+    /// Music User Token — and they are different shapes. `TokenStore` below is
+    /// one caller of these, not the other way round.
+    pub fn load_raw<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
+        match self.entry()?.get_password() {
+            Ok(raw) => Ok(Some(serde_json::from_str(&raw).with_context(|| {
+                format!("parsing what is stored under {}", self.account)
+            })?)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(anyhow!("reading {}: {err}", self.account)),
+        }
+    }
+
+    pub fn save_raw<T: serde::Serialize>(&self, value: &T) -> Result<()> {
+        let raw = serde_json::to_string(value)?;
+        self.entry()?
+            .set_password(&raw)
+            .map_err(|err| anyhow!("saving {}: {err}", self.account))
+    }
+
+    pub fn clear_raw(&self) -> Result<()> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(anyhow!("clearing {}: {err}", self.account)),
+        }
+    }
 }
 
 impl Default for KeyringStore {
@@ -88,27 +117,15 @@ impl Default for KeyringStore {
 
 impl TokenStore for KeyringStore {
     fn load(&self) -> Result<Option<Tokens>> {
-        match self.entry()?.get_password() {
-            Ok(raw) => Ok(Some(
-                serde_json::from_str(&raw).context("parsing stored tokens")?,
-            )),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(anyhow!("reading stored tokens: {err}")),
-        }
+        self.load_raw()
     }
 
     fn save(&self, tokens: &Tokens) -> Result<()> {
-        let raw = serde_json::to_string(tokens)?;
-        self.entry()?
-            .set_password(&raw)
-            .map_err(|err| anyhow!("saving tokens: {err}"))
+        self.save_raw(tokens)
     }
 
     fn clear(&self) -> Result<()> {
-        match self.entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(anyhow!("clearing tokens: {err}")),
-        }
+        self.clear_raw()
     }
 }
 
@@ -169,7 +186,7 @@ impl Pkce {
     }
 }
 
-fn random_b64url(bytes: usize) -> Result<String> {
+pub(crate) fn random_b64url(bytes: usize) -> Result<String> {
     let mut buf = vec![0u8; bytes];
     getrandom::getrandom(&mut buf).map_err(|err| anyhow!("generating random bytes: {err}"))?;
     Ok(B64URL.encode(buf))
@@ -342,6 +359,19 @@ fn parse_callback(path: &str, expected_state: &str) -> Result<String> {
 }
 
 async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
+    serve_loopback_callback(listener, |path| parse_callback(path, expected_state)).await
+}
+
+/// Serve exactly one loopback redirect and hand its path to `parse`.
+///
+/// The transport is identical whichever provider sent the user back — bind,
+/// ignore the browser's favicon probe, answer with a page telling them to go
+/// back to the app — so only the parsing differs. Apple Music returns a Music
+/// User Token where Spotify returns an authorization code.
+pub(crate) async fn serve_loopback_callback<T, F>(listener: TcpListener, parse: F) -> Result<T>
+where
+    F: Fn(&str) -> Result<T>,
+{
     loop {
         let (mut stream, _) = listener.accept().await.context("accepting redirect")?;
 
@@ -367,12 +397,12 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
             continue;
         }
 
-        let result = parse_callback(path, expected_state);
+        let result = parse(path);
         let page = match &result {
             Ok(_) => {
-                "<h2>Connected.</h2><p>You can close this tab and go back to the terminal.</p>"
+                "<h2>Connected.</h2><p>You can close this tab and go back to DJ Library Sync.</p>"
             }
-            Err(_) => "<h2>Something went wrong.</h2><p>Check the terminal for details.</p>",
+            Err(_) => "<h2>Something went wrong.</h2><p>Go back to DJ Library Sync for details.</p>",
         };
         let body = format!(
             "<!doctype html><meta charset=utf-8><title>DJ Library Sync</title>\
