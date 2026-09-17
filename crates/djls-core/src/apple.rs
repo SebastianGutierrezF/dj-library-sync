@@ -713,6 +713,26 @@ impl MusicPlatform for AppleClient {
     }
 
     async fn create_playlist(&self, name: &str, _public: bool) -> Result<PlatformPlaylist> {
+        // Creating by name is idempotent here, deliberately.
+        //
+        // Apple's library is eventually consistent, so a playlist created a
+        // moment ago may not be in the list the caller checked before deciding
+        // to create one. That is how two playlists with the same name appeared:
+        // one run created it and then failed on the empty response body, and
+        // the next run could not yet see it.
+        //
+        // The cost is that two playlists genuinely meant to share a name cannot
+        // be made from here. They are named by date, so that is not a case this
+        // app produces.
+        if let Some(existing) = self
+            .list_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(existing);
+        }
+
         // `public` is ignored on purpose: Apple's library playlist API has no
         // such attribute. Accepting it and doing nothing is better than
         // changing the trait for one platform's omission.
