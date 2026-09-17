@@ -671,7 +671,12 @@ async fn match_folder(
         // makes the failure permanent: the next run serves it from the cache
         // and never retries.
         if search_error.is_none() {
-            let _ = db.record_match(record.id, &platform, &outcome);
+            if let Err(err) = db.record_match(record.id, &platform, &outcome) {
+                // Not fatal — the match is still returned to the UI — but a
+                // silent failure here means the next run has no memory of
+                // this one, and nothing would ever say why.
+                eprintln!("[db] could not record the {platform} match: {err:#}");
+            }
         }
 
         rows.push(MatchRow {
@@ -748,12 +753,39 @@ struct PushResult {
     skipped: usize,
 }
 
+/// Whether an identifier plausibly belongs to `platform`.
+///
+/// Spotify URIs are `spotify:track:<id>`; Apple's are bare numeric catalogue
+/// ids. Sending one to the other is not a near miss — Apple answers a Spotify
+/// URI with `500 Unable to update tracks`, which reads like an outage on their
+/// side rather than a mistake on ours.
+fn uri_belongs_to(platform: &str, uri: &str) -> bool {
+    match platform {
+        PLATFORM_SPOTIFY => uri.starts_with("spotify:track:") && uri.len() > "spotify:track:".len(),
+        // `all` is vacuously true on an empty string, so the emptiness check
+        // has to come first or a blank id sails through.
+        PLATFORM_APPLE_MUSIC => !uri.is_empty() && uri.chars().all(|c| c.is_ascii_digit()),
+        _ => true,
+    }
+}
+
 #[tauri::command]
 async fn push_tracks(
     playlist_name: String,
     platform: String,
     items: Vec<PushItem>,
 ) -> Result<PushResult, String> {
+    // Catch a cross-platform push before it leaves the machine. Matches are
+    // stored per platform and the UI clears them when the target changes, so
+    // this should be unreachable — which is exactly why it is worth asserting
+    // rather than trusting.
+    if let Some(wrong) = items.iter().find(|i| !uri_belongs_to(&platform, &i.uri)) {
+        return Err(format!(
+            "These matches are not for {platform}: \"{}\" looks like it came from another              service. Re-match this folder with {platform} selected before pushing.",
+            wrong.uri
+        ));
+    }
+
     let client = platform_client(&platform).await?;
     let db = Database::open(&Database::default_path()).map_err(|e| format!("{e:#}"))?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
@@ -818,7 +850,12 @@ async fn push_tracks(
 
     // Logged only after the write lands, so a failure is retried not swallowed.
     for (track_id, uri) in &to_add {
-        let _ = db.record_sync(*track_id, &platform, uri, &playlist.id);
+        if let Err(err) = db.record_sync(*track_id, &platform, uri, &playlist.id) {
+            // The track is in the playlist either way; losing the log only
+            // risks offering it again next time, which the playlist contents
+            // check would then catch.
+            eprintln!("[db] could not log the {platform} push of {uri}: {err:#}");
+        }
     }
 
     // After the log, for the same reason: billing must never be the thing that
@@ -860,4 +897,45 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJ Library Sync");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spotify_uri_is_never_pushed_to_apple() {
+        // Apple answers a Spotify URI with "500 Unable to update tracks",
+        // which reads like an outage rather than a mistake on our side.
+        assert!(!uri_belongs_to(
+            PLATFORM_APPLE_MUSIC,
+            "spotify:track:6I9VzXrHxO9rA9A5euc8Ak"
+        ));
+        assert!(uri_belongs_to(PLATFORM_APPLE_MUSIC, "1440857781"));
+    }
+
+    #[test]
+    fn an_apple_id_is_never_pushed_to_spotify() {
+        assert!(!uri_belongs_to(PLATFORM_SPOTIFY, "1440857781"));
+        assert!(uri_belongs_to(
+            PLATFORM_SPOTIFY,
+            "spotify:track:6I9VzXrHxO9rA9A5euc8Ak"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_platform_is_not_second_guessed() {
+        // A new adapter should not be blocked by a guard that has never heard
+        // of its identifier format.
+        assert!(uri_belongs_to("tidal", "anything-at-all"));
+    }
+
+    #[test]
+    fn apple_ids_are_digits_only() {
+        // Library ids (i.xxx) and playlist ids (p.xxx) cannot be added as
+        // catalogue songs, so they must not pass either.
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, "i.abc123"));
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, "p.xyz789"));
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, ""));
+    }
 }
