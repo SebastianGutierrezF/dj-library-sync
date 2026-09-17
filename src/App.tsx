@@ -43,6 +43,10 @@ export default function App() {
   const [redirect, setRedirect] = useState<string>("");
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
   const [connecting, setConnecting] = useState<string | null>(null);
+  /** The services screen was a dead end: it only rendered when nothing was
+   *  connected, so once Spotify was set up there was no way back to it to add
+   *  or change anything. It is a mode now, reachable from the header. */
+  const [showServices, setShowServices] = useState(false);
   /**
    * Which service the sync path talks to. Spotify unless Apple Music is fully
    * connected, because Apple needs both a licence and a Music User Token and
@@ -296,11 +300,36 @@ export default function App() {
   if (!config) return <div className="app"><p className="dim">Loading…</p></div>;
 
   // --- Connect a service --------------------------------------------------
-  if (!account?.configured || !account?.signed_in) {
+  // Forced when *nothing* is connected, not when Spotify specifically is not.
+  // Checking Spotify would strand someone who signed out of it while Apple
+  // Music was working: the app has a usable target, but no way off this screen.
+  const mustConnect = connectedTargets.length === 0;
+
+  if (showServices || mustConnect) {
+    const leaveServices = async () => {
+      setConnecting(null);
+      setShowServices(false);
+      await refreshAccount();
+      void refreshLicence();
+    };
+
     return (
       <div className="app">
-        <h1>DJ Library Sync</h1>
-        <p className="dim intro">Pick where your new downloads should end up.</p>
+        <header className="services-head">
+          <div>
+            <h1>Services</h1>
+            <p className="dim intro">
+              {mustConnect
+                ? "Pick where your new downloads should end up."
+                : "Connect another service, or change how one is set up."}
+            </p>
+          </div>
+          {!mustConnect && (
+            <button className="ghost" onClick={leaveServices}>
+              Done
+            </button>
+          )}
+        </header>
 
         {error && <div className="banner error">{error}</div>}
 
@@ -318,16 +347,19 @@ export default function App() {
                       : "One-click sign in"}
                   </p>
                 </div>
-                {p.connected ? (
-                  <span className="pill good">connected</span>
-                ) : p.available ? (
-                  <button
-                    onClick={() =>
-                      setConnecting(connecting === p.id ? null : p.id)
-                    }
-                  >
-                    {connecting === p.id ? "Close" : "Connect"}
-                  </button>
+                {p.available ? (
+                  <div className="service-actions">
+                    {p.connected && <span className="pill good">connected</span>}
+                    {/* Connected is not the end of the story: a client ID can
+                        be wrong, an account can be the wrong one. Always leave
+                        a way back into the setup. */}
+                    <button
+                      className={p.connected ? "ghost" : ""}
+                      onClick={() => setConnecting(connecting === p.id ? null : p.id)}
+                    >
+                      {connecting === p.id ? "Close" : p.connected ? "Manage" : "Connect"}
+                    </button>
+                  </div>
                 ) : (
                   <span className="pill">{p.metered ? "paid" : "free"}</span>
                 )}
@@ -369,6 +401,30 @@ export default function App() {
                       {account?.configured ? "Sign in" : "Save"}
                     </button>
                   </div>
+
+                  {p.connected && (
+                    <div className="row">
+                      <button
+                        className="ghost"
+                        onClick={async () => {
+                          setBusy("Signing out…");
+                          try {
+                            await invoke("spotify_logout");
+                            await refreshAccount();
+                          } catch (err) {
+                            setError(String(err));
+                          } finally {
+                            setBusy(null);
+                          }
+                        }}
+                      >
+                        Sign out of Spotify
+                      </button>
+                      <span className="dim small">
+                        Leaves your Client ID in place; only the account changes.
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -472,6 +528,10 @@ export default function App() {
     );
   }
 
+  // The services gate no longer implies a loaded account, so say so once here
+  // rather than defending against null at every use below.
+  if (!account) return <div className="app"><p className="dim">Loading…</p></div>;
+
   return (
     <div className="app">
       <header>
@@ -503,11 +563,12 @@ export default function App() {
           {target === "apple_music" && licence && !licence.unlimited && (
             <span className="pill">{licence.credits ?? 0} left</span>
           )}
-          {account.signed_in ? (
+          {account.signed_in && (
             <span className="who">{account.display_name ?? account.user_id}</span>
-          ) : (
-            <button onClick={signIn}>Connect Spotify</button>
           )}
+          <button className="ghost" onClick={() => setShowServices(true)}>
+            Services
+          </button>
           <button className="ghost" onClick={chooseFolder}>
             {config.watch_folder ? "Change folder" : "Choose folder"}
           </button>
