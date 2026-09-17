@@ -203,9 +203,18 @@ export default function App() {
   const runMatch = useCallback(
     async (rescan: boolean) => {
       if (!config?.watch_folder) return;
-      setBusy(rescan ? "Re-querying Spotify…" : "Matching…");
+      setBusy(rescan ? "Re-checking everything…" : "Matching…");
       setError(null);
+
+      // Cleared before the run, not after it. All of these are keyed by the
+      // local track id, which is identical on every platform, so results that
+      // survived a failed run looked current and could be pushed to a service
+      // they were never matched against.
+      setRows([]);
+      setSelected(new Set());
+      setChosen({});
       setResult(null);
+
       try {
         const found = await invoke<MatchRow[]>("match_folder", {
           platform: target,
@@ -244,20 +253,27 @@ export default function App() {
   const push = useCallback(async () => {
     const items = rows
       .filter((r) => selected.has(r.track_id))
-      .map((r) => {
+      .flatMap((r) => {
         const uri = chosen[r.track_id];
         const c = r.candidates.find((x) => x.track.uri === uri);
-        return {
-          track_id: r.track_id,
-          uri,
-          // Sent so the backend can spot the same recording under a
-          // different Spotify URI, not just an identical one.
-          name: c?.track.name ?? "",
-          artists: c?.track.artists.join(", ") ?? "",
-          duration_ms: c?.track.duration_ms ?? 0,
-        };
-      })
-      .filter((i) => Boolean(i.uri));
+
+        // A choice that is not among this row's own candidates belongs to an
+        // earlier run. Sending it anyway pushed a stale URI with blank
+        // metadata, which also defeats the duplicate check on the way in.
+        if (!uri || !c) return [];
+
+        return [
+          {
+            track_id: r.track_id,
+            uri,
+            // Sent so the backend can spot the same recording under a
+            // different id, not just an identical one.
+            name: c.track.name,
+            artists: c.track.artists.join(", "),
+            duration_ms: c.track.duration_ms,
+          },
+        ];
+      });
 
     if (items.length === 0 || !config) return;
 
@@ -548,9 +564,13 @@ export default function App() {
               value={target}
               onChange={(e) => {
                 setTarget(e.target.value);
-                // Matches and playlists are per-platform, so what is on screen
-                // belongs to the old one.
+                // Matches, choices and playlists are all per-platform, so
+                // everything on screen belongs to the old one. `chosen` and
+                // `selected` are keyed by local track id, so leaving them
+                // behind means carrying one service's URIs into another.
                 setRows([]);
+                setSelected(new Set());
+                setChosen({});
                 setPlaylists([]);
                 setResult(null);
               }}
