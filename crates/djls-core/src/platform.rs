@@ -61,18 +61,17 @@ impl PlatformInfo {
         available: true,
     };
 
-    /// Not implemented yet. Listed so the connect screen can show what is
-    /// coming and which model each platform will use.
     /// Apple Music supports both models — see `docs/apple-music-auth.md`.
     /// Hosted is the default because signing developer tokens needs a private
     /// key that cannot ship in an open-source app; users with their own Apple
-    /// Developer membership can supply a key instead and pay nothing.
+    /// Developer membership could supply a key instead and pay nothing, which
+    /// is not built yet — `apple.rs` implements the hosted path only.
     pub const APPLE_MUSIC: PlatformInfo = PlatformInfo {
         id: "apple_music",
         display_name: "Apple Music",
         credentials: CredentialModel::Hosted,
         metered: true,
-        available: false,
+        available: true,
     };
 
     pub const TIDAL: PlatformInfo = PlatformInfo {

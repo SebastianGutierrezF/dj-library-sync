@@ -4,6 +4,7 @@
 //! scoring and the Spotify client all live here so the matcher can be measured
 //! from the CLI long before any UI exists.
 
+pub mod apple;
 pub mod auth;
 pub mod config;
 pub mod db;
