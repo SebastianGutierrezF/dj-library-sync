@@ -8,9 +8,11 @@ use std::sync::Mutex;
 
 use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
 use djls_core::config::Config;
-use djls_core::db::{Database, PLATFORM_SPOTIFY};
+use djls_core::apple::{AppleClient, DeveloperTokenSource};
+use djls_core::db::{Database, PLATFORM_APPLE_MUSIC, PLATFORM_SPOTIFY};
 use djls_core::licence;
 use djls_core::matcher::{evaluate, Candidate, MatchOutcome, ShorterVersionPolicy, Thresholds};
+use djls_core::platform::MusicPlatform;
 use djls_core::spotify::SpotifyClient;
 use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, FolderWatcher, WatcherConfig};
@@ -167,6 +169,64 @@ fn auth_config() -> Result<AuthConfig, String> {
 fn user_client() -> Result<SpotifyClient, String> {
     SpotifyClient::for_user(auth_config()?, Box::new(KeyringStore::default()))
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Build a client for whichever platform the user is syncing to.
+///
+/// Everything above this — scanning, scoring, the database, the push guards —
+/// is platform-agnostic, so the sync path takes a trait object and never asks
+/// which service it is talking to.
+async fn platform_client(platform: &str) -> Result<Box<dyn MusicPlatform>, String> {
+    match platform {
+        PLATFORM_SPOTIFY => Ok(Box::new(user_client()?)),
+        PLATFORM_APPLE_MUSIC => {
+            let stored = current_licence()
+                .await?
+                .ok_or_else(|| "Start a trial or enter a licence key first.".to_string())?;
+
+            let user_token = licence::AppleTokenKeyring::default()
+                .load()
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| {
+                    "Apple Music is not connected on this machine. Connect it from                      the Services screen."
+                        .to_string()
+                })?;
+
+            let client = AppleClient::new(
+                DeveloperTokenSource::Hosted {
+                    service_url: licence::service_url(),
+                    activation_token: stored.token,
+                },
+                Some(user_token),
+            )
+            .map_err(|e| format!("{e:#}"))?;
+
+            Ok(Box::new(client))
+        }
+        other => Err(format!("Unknown platform: {other}")),
+    }
+}
+
+/// Tell the service how many tracks were pushed.
+///
+/// Best-effort and deliberately non-fatal: the tracks are already in the
+/// playlist, and a billing failure must never be reported to the user as a
+/// failed push. Spotify is not metered at all, so it never gets here.
+async fn report_usage(platform: &str, tracks: usize) {
+    if platform != PLATFORM_APPLE_MUSIC || tracks == 0 {
+        return;
+    }
+
+    let Ok(Some(stored)) = current_licence().await else {
+        return;
+    };
+    let Ok(client) = licence::ServiceClient::new(licence::service_url()) else {
+        return;
+    };
+
+    if let Err(err) = client.report_usage(&stored.token, tracks as u32).await {
+        eprintln!("[licence] usage not reported ({tracks} tracks): {err:#}");
+    }
 }
 
 #[tauri::command]
@@ -509,11 +569,12 @@ struct MatchProgress {
 async fn match_folder(
     app: AppHandle,
     path: String,
+    platform: String,
     accept_shorter: bool,
     rescan: bool,
 ) -> Result<Vec<MatchRow>, String> {
     let folder = ensure_folder(&path)?;
-    let client = user_client()?;
+    let client = platform_client(&platform).await?;
     let db = Database::open(&Database::default_path()).map_err(|e| format!("{e:#}"))?;
 
     let thresholds = Thresholds {
@@ -535,7 +596,7 @@ async fn match_folder(
         let record = db.upsert_track(&track).map_err(|e| format!("{e:#}"))?;
 
         if !rescan && record.can_reuse_match() {
-            if let Ok(Some(stored)) = db.stored_match(record.id, PLATFORM_SPOTIFY) {
+            if let Ok(Some(stored)) = db.stored_match(record.id, &platform) {
                 rows.push(MatchRow {
                     track_id: record.id,
                     track,
@@ -566,7 +627,7 @@ async fn match_folder(
         };
 
         let outcome: MatchOutcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
-        let _ = db.record_match(record.id, PLATFORM_SPOTIFY, &outcome);
+        let _ = db.record_match(record.id, &platform, &outcome);
 
         rows.push(MatchRow {
             track_id: record.id,
@@ -597,8 +658,8 @@ struct PlaylistInfo {
 }
 
 #[tauri::command]
-async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
-    let client = user_client()?;
+async fn list_playlists(platform: String) -> Result<Vec<PlaylistInfo>, String> {
+    let client = platform_client(&platform).await?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
     let playlists = client
         .list_playlists()
@@ -607,7 +668,9 @@ async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
 
     Ok(playlists
         .into_iter()
-        .filter(|p| p.is_owned_by(&me.id))
+        // Offer what can actually be written to. Apple reports no owner, and
+        // filtering on ownership would leave the list empty.
+        .filter(|p| p.is_writable_by(&me.id))
         .map(|p| PlaylistInfo {
             track_count: p.track_count(),
             owned: true,
@@ -640,8 +703,12 @@ struct PushResult {
 }
 
 #[tauri::command]
-async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<PushResult, String> {
-    let client = user_client()?;
+async fn push_tracks(
+    playlist_name: String,
+    platform: String,
+    items: Vec<PushItem>,
+) -> Result<PushResult, String> {
+    let client = platform_client(&platform).await?;
     let db = Database::open(&Database::default_path()).map_err(|e| format!("{e:#}"))?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
 
@@ -650,7 +717,9 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
         .await
         .map_err(|e| format!("{e:#}"))?
         .into_iter()
-        .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_owned_by(&me.id));
+        // Writable, not owned: Apple's library playlists carry no owner, and
+        // reading that as "not mine" would create a duplicate every run.
+        .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_writable_by(&me.id));
 
     let already = match &existing {
         Some(p) => client.playlist_entries(&p.id).await.unwrap_or_default(),
@@ -672,7 +741,7 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
 
     for item in items {
         let logged = db
-            .already_synced(item.track_id, &playlist.id, PLATFORM_SPOTIFY)
+            .already_synced(item.track_id, &playlist.id, &platform)
             .unwrap_or(false);
         let dupe = to_add.iter().any(|(_, uri)| uri == &item.uri);
 
@@ -697,14 +766,18 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
 
     let uris: Vec<String> = to_add.iter().map(|(_, uri)| uri.clone()).collect();
     let added = client
-        .add_tracks_to_playlist(&playlist.id, &uris)
+        .add_tracks(&playlist.id, &uris)
         .await
         .map_err(|e| format!("{e:#}"))?;
 
     // Logged only after the write lands, so a failure is retried not swallowed.
     for (track_id, uri) in &to_add {
-        let _ = db.record_sync(*track_id, PLATFORM_SPOTIFY, uri, &playlist.id);
+        let _ = db.record_sync(*track_id, &platform, uri, &playlist.id);
     }
+
+    // After the log, for the same reason: billing must never be the thing that
+    // makes a successful push look like a failure.
+    report_usage(&platform, added).await;
 
     Ok(PushResult {
         playlist_name: playlist.name,

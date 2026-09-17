@@ -495,6 +495,21 @@ impl Playlist {
             .map(|o| o.id == user_id)
             .unwrap_or(false)
     }
+
+    /// Whether this playlist can be a sync target.
+    ///
+    /// Not the same question as ownership. Spotify's playlist list includes
+    /// playlists the user merely follows, which cannot be written to, so there
+    /// the owner has to match. Apple's library playlists are by definition the
+    /// user's own and carry no owner field at all — reading that absence as
+    /// "not mine" would mean never finding the playlist again and creating a
+    /// fresh duplicate on every run.
+    pub fn is_writable_by(&self, user_id: &str) -> bool {
+        match &self.owner {
+            Some(owner) => owner.id == user_id,
+            None => true,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -814,5 +829,40 @@ impl crate::platform::MusicPlatform for SpotifyClient {
 
     async fn add_tracks(&self, playlist_id: &str, uris: &[String]) -> Result<usize> {
         SpotifyClient::add_tracks_to_playlist(self, playlist_id, uris).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_playlist_with_no_owner_is_writable() {
+        // Apple's library playlists carry no owner. Treating that absence as
+        // "not mine" meant never finding the playlist again, so every push
+        // would have created a fresh duplicate.
+        let apple: Playlist =
+            serde_json::from_str(r#"{"id":"p.1","name":"New Downloads"}"#).unwrap();
+        assert!(apple.is_writable_by("anyone"));
+        assert!(
+            !apple.is_owned_by("anyone"),
+            "ownership is genuinely unknown — only writability is being asserted"
+        );
+    }
+
+    #[test]
+    fn a_followed_playlist_is_not_writable() {
+        // Spotify lists playlists the user merely follows; writing to one
+        // fails, so there the owner still has to match.
+        let followed: Playlist = serde_json::from_str(
+            r#"{"id":"1","name":"Someone else's","owner":{"id":"them"}}"#,
+        )
+        .unwrap();
+        assert!(!followed.is_writable_by("me"));
+
+        let mine: Playlist =
+            serde_json::from_str(r#"{"id":"2","name":"Mine","owner":{"id":"me"}}"#).unwrap();
+        assert!(mine.is_writable_by("me"));
+        assert!(mine.is_owned_by("me"));
     }
 }

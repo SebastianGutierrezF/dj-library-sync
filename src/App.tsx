@@ -43,6 +43,12 @@ export default function App() {
   const [redirect, setRedirect] = useState<string>("");
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
   const [connecting, setConnecting] = useState<string | null>(null);
+  /**
+   * Which service the sync path talks to. Spotify unless Apple Music is fully
+   * connected, because Apple needs both a licence and a Music User Token and
+   * defaulting to it would fail on first use for everyone else.
+   */
+  const [target, setTarget] = useState<string>("spotify");
   const [licence, setLicence] = useState<LicenceStatus | null>(null);
   const [licenceDraft, setLicenceDraft] = useState("");
   const [licenceBusy, setLicenceBusy] = useState(false);
@@ -65,6 +71,12 @@ export default function App() {
     setAccount(await invoke<AccountStatus>("account_status"));
     setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
+
+  /** Platforms actually usable right now — the only ones worth offering. */
+  const connectedTargets = useMemo(
+    () => platforms.filter((p) => p.available && p.connected),
+    [platforms],
+  );
 
   const refreshLicence = useCallback(async () => {
     try {
@@ -91,6 +103,16 @@ export default function App() {
     },
     [refreshAccount],
   );
+
+  // Keep the target on something that works. If the current one is
+  // disconnected — a licence cleared, Apple signed out — fall back rather than
+  // leaving the app pointed at a service it cannot reach.
+  useEffect(() => {
+    if (connectedTargets.length === 0) return;
+    if (!connectedTargets.some((p) => p.id === target)) {
+      setTarget(connectedTargets[0].id);
+    }
+  }, [connectedTargets, target]);
 
   const [bootError, setBootError] = useState<string | null>(null);
 
@@ -179,6 +201,7 @@ export default function App() {
       setResult(null);
       try {
         const found = await invoke<MatchRow[]>("match_folder", {
+          platform: target,
           path: config.watch_folder,
           acceptShorter: config.accept_shorter,
           rescan,
@@ -205,7 +228,7 @@ export default function App() {
 
   const loadPlaylists = useCallback(async () => {
     try {
-      setPlaylists(await invoke<PlaylistInfo[]>("list_playlists"));
+      setPlaylists(await invoke<PlaylistInfo[]>("list_playlists", { platform: target }));
     } catch (err) {
       setError(String(err));
     }
@@ -234,7 +257,13 @@ export default function App() {
     setBusy(`Adding ${items.length} track(s)…`);
     setError(null);
     try {
-      const res = await invoke<PushResult>("push_tracks", { playlistName, items });
+      const res = await invoke<PushResult>("push_tracks", {
+        playlistName,
+        platform: target,
+        items,
+      });
+      // The balance moved if this was a metered platform.
+      void refreshLicence();
       setResult(res);
       await persist({ ...config, last_playlist: playlistName });
     } catch (err) {
@@ -451,6 +480,29 @@ export default function App() {
           <p className="folder">{config.watch_folder ?? "No folder selected"}</p>
         </div>
         <div className="actions">
+          {connectedTargets.length > 1 && (
+            <select
+              value={target}
+              onChange={(e) => {
+                setTarget(e.target.value);
+                // Matches and playlists are per-platform, so what is on screen
+                // belongs to the old one.
+                setRows([]);
+                setPlaylists([]);
+                setResult(null);
+              }}
+              aria-label="Sync to"
+            >
+              {connectedTargets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.display_name}
+                </option>
+              ))}
+            </select>
+          )}
+          {target === "apple_music" && licence && !licence.unlimited && (
+            <span className="pill">{licence.credits ?? 0} left</span>
+          )}
           {account.signed_in ? (
             <span className="who">{account.display_name ?? account.user_id}</span>
           ) : (
