@@ -50,6 +50,16 @@ still running. If `licenceStore` says "in-memory", the Postgres did not wire up
 — stop, because trials will reset on every deploy and the smoke test below will
 lie to you.
 
+Set **`PUBLIC_ORIGIN`** to the origin this service is actually served from, no
+trailing slash. It is load-bearing in three places: the developer token's
+`origin` claim, the checkout success and cancel URLs, and the payment callback
+URL.
+
+Left unset it falls back to `http://localhost:8787`, and Apple then refuses a
+developer token whose origin does not match the page it was served to. MusicKit
+reports that as **"Storefront Country Code error"** — a message naming nothing
+to do with the cause. `/readyz` checks for it now; it is the fifth check.
+
 Also point `RELEASE_REPO` at `synccrate`. The repository was renamed; downloads
 work today only because GitHub redirects.
 
