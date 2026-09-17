@@ -85,6 +85,8 @@ export interface MatchRow {
   confidence: number;
   reason: string;
   candidates: Candidate[];
+  /** Set when the search failed, as opposed to finding nothing. */
+  error: string | null;
   cached: boolean;
 }
 

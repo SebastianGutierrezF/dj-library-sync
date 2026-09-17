@@ -19,6 +19,10 @@ use djls_core::watcher::{watch_folder, FolderWatcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
+/// Give up once this many searches have been attempted and most have failed.
+const MIN_ATTEMPTS_BEFORE_ABORT: usize = 5;
+const ABORT_ERROR_RATE: f64 = 0.5;
+
 /// Candidates per search query; Spotify caps development-mode apps at 10.
 const SEARCH_LIMIT: u32 = 10;
 
@@ -555,6 +559,9 @@ struct MatchRow {
     confidence: f32,
     reason: String,
     candidates: Vec<Candidate>,
+    /// Set when the search itself failed, as opposed to finding nothing. The
+    /// difference matters: one is worth retrying, the other is not.
+    error: Option<String>,
     /// True when this came from the local database rather than a fresh query.
     cached: bool,
 }
@@ -589,6 +596,7 @@ async fn match_folder(
     let (tracks, _failures) = scan_folder(&folder, true);
     let total = tracks.len();
     let mut rows = Vec::with_capacity(total);
+    let mut failed = 0usize;
 
     for (index, track) in tracks.into_iter().enumerate() {
         let _ = app.emit("match-progress", MatchProgress { done: index, total });
@@ -607,27 +615,64 @@ async fn match_folder(
                     // Candidates are not persisted, so a cached row cannot
                     // offer alternatives; re-scan to get them back.
                     candidates: Vec::new(),
+                    error: None,
                     cached: true,
                 });
                 continue;
             }
         }
 
+        // A failed search is not the same thing as a track that is not on the
+        // platform. `unwrap_or_default()` conflated them, which turned an
+        // outage into a confident 0% match rate — and then cached it.
+        let mut search_error = None;
+
         let isrc_hits = match &track.isrc {
-            Some(isrc) => client.search_isrc(isrc).await.unwrap_or_default(),
+            Some(isrc) => match client.search_isrc(isrc).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
-        let text_hits = if isrc_hits.is_empty() {
-            client
-                .search_for_track(&track, SEARCH_LIMIT)
-                .await
-                .unwrap_or_default()
+
+        let text_hits = if isrc_hits.is_empty() && search_error.is_none() {
+            match client.search_for_track(&track, SEARCH_LIMIT).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
 
+        if let Some(message) = &search_error {
+            failed += 1;
+
+            // Stop early rather than grinding through hundreds of tracks to
+            // produce a match rate that means nothing.
+            let attempts = index + 1;
+            if attempts >= MIN_ATTEMPTS_BEFORE_ABORT
+                && (failed as f64 / attempts as f64) >= ABORT_ERROR_RATE
+            {
+                return Err(format!(
+                    "Stopped: {failed} of the first {attempts} searches failed, so any                      match rate would be meaningless. The last error was:\n{message}"
+                ));
+            }
+        }
+
         let outcome: MatchOutcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
-        let _ = db.record_match(record.id, &platform, &outcome);
+
+        // Only cache a real answer. Recording a failed search as "no match"
+        // makes the failure permanent: the next run serves it from the cache
+        // and never retries.
+        if search_error.is_none() {
+            let _ = db.record_match(record.id, &platform, &outcome);
+        }
 
         rows.push(MatchRow {
             track_id: record.id,
@@ -637,6 +682,7 @@ async fn match_folder(
             confidence: outcome.confidence(),
             reason: outcome.reason.clone(),
             candidates: outcome.candidates,
+            error: search_error,
             cached: false,
         });
     }

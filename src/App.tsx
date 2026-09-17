@@ -76,6 +76,9 @@ export default function App() {
     setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
 
+  /** Rows whose search errored, which is not the same as finding nothing. */
+  const searchFailures = useMemo(() => rows.filter((r) => r.error).length, [rows]);
+
   /** Platforms actually usable right now — the only ones worth offering. */
   const connectedTargets = useMemo(
     () => platforms.filter((p) => p.available && p.connected),
@@ -587,6 +590,13 @@ export default function App() {
         </div>
       )}
       {error && <div className="banner error">{error}</div>}
+      {searchFailures > 0 && (
+        <div className="banner error">
+          {searchFailures} of {rows.length} searches failed, so those rows say nothing
+          about whether the tracks exist on {target === "apple_music" ? "Apple Music" : "Spotify"}.
+          Nothing was saved for them — fix the cause and run it again.
+        </div>
+      )}
       {result && (
         <div className="banner good">
           Added {result.added} to “{result.playlist_name}”
@@ -718,7 +728,13 @@ function RowView({
               </div>
             </>
           ) : (
-            <span className="dim">{row.cached ? "cached — re-check to see options" : row.reason}</span>
+            <span className={row.error ? "warn" : "dim"}>
+              {row.error
+                ? `Search failed — ${row.error}`
+                : row.cached
+                ? "cached — re-check to see options"
+                : row.reason}
+            </span>
           )}
           {alternatives && (
             <button className="link" onClick={() => setExpanded((v) => !v)}>
