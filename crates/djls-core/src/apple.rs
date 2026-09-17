@@ -364,6 +364,27 @@ impl AppleClient {
     }
 }
 
+/// How hard to look for a playlist Apple has accepted but not yet listed.
+const CREATE_LOOKUP_ATTEMPTS: u32 = 4;
+const CREATE_LOOKUP_DELAY: Duration = Duration::from_millis(700);
+
+/// The created playlist, when Apple bothered to return one.
+///
+/// Separate so the empty-body case is testable without a network: an empty or
+/// non-JSON body is a normal successful response here, not a failure, and
+/// treating it as a parse error failed a push whose playlist had been created.
+fn parse_created_playlist(body: &str) -> Option<PlatformPlaylist> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<LibraryPage<LibraryPlaylist>>(body)
+        .ok()?
+        .data
+        .into_iter()
+        .next()
+        .map(LibraryPlaylist::into_playlist)
+}
+
 /// Turn Apple's status codes into something that names the actual fix.
 fn describe_failure(status: u16, body: &str) -> String {
     match status {
@@ -708,14 +729,33 @@ impl MusicPlatform for AppleClient {
             )
             .await?;
 
-        let resp: LibraryPage<LibraryPlaylist> =
-            serde_json::from_str(&text).context("parsing the created playlist")?;
+        // Apple accepts the write and frequently answers with an empty body —
+        // library mutations are applied asynchronously, so there is nothing to
+        // echo back yet. Parse the playlist when it is there.
+        if let Some(created) = parse_created_playlist(&text) {
+            return Ok(created);
+        }
 
-        resp.data
-            .into_iter()
-            .next()
-            .map(LibraryPlaylist::into_playlist)
-            .ok_or_else(|| anyhow!("Apple Music created the playlist but returned nothing"))
+        // Otherwise find it by name. The library is eventually consistent, so
+        // it may take a moment to appear; a few short waits beat failing a
+        // push that actually succeeded.
+        for attempt in 0..CREATE_LOOKUP_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CREATE_LOOKUP_DELAY).await;
+            }
+            if let Some(found) = self
+                .list_playlists()
+                .await?
+                .into_iter()
+                .find(|p| p.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(found);
+            }
+        }
+
+        Err(anyhow!(
+            "Apple Music accepted the new playlist \"{name}\" but it has not appeared in              the library yet. It may show up shortly — try the push again."
+        ))
     }
 
     async fn playlist_entries(&self, playlist_id: &str) -> Result<Vec<PlatformEntry>> {
@@ -965,6 +1005,33 @@ mod tests {
         let resp: StorefrontResponse =
             serde_json::from_str(r#"{"data":[{"id":"us","type":"storefronts"}]}"#).unwrap();
         assert_eq!(resp.data.first().unwrap().id, "us");
+    }
+
+    #[test]
+    fn an_empty_create_response_is_not_a_failure() {
+        // Apple applies library writes asynchronously and answers with an
+        // empty body. Treating that as a parse error — "expected value at line
+        // 1 column 1" — failed a push whose playlist had in fact been created.
+        assert!(parse_created_playlist("").is_none());
+        assert!(parse_created_playlist("   \n ").is_none());
+        // Not JSON at all is the same situation, not a reason to give up.
+        assert!(parse_created_playlist("Accepted").is_none());
+    }
+
+    #[test]
+    fn a_create_response_with_the_playlist_is_used_directly() {
+        let created = parse_created_playlist(
+            r#"{"data":[{"id":"p.abc","type":"library-playlists",
+                "attributes":{"name":"New Downloads 2026-09-17","canEdit":true}}]}"#,
+        )
+        .expect("a populated response should parse");
+        assert_eq!(created.id, "p.abc");
+        assert_eq!(created.name, "New Downloads 2026-09-17");
+    }
+
+    #[test]
+    fn a_response_with_an_empty_data_array_falls_back_too() {
+        assert!(parse_created_playlist(r#"{"data":[]}"#).is_none());
     }
 
     #[test]
