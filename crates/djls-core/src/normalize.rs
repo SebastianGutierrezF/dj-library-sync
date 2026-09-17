@@ -223,7 +223,9 @@ pub fn split_artists(input: &str) -> Vec<String> {
     for sep in SEPS {
         let mut next = Vec::new();
         for part in parts {
-            let lower = part.to_lowercase();
+            // ASCII-only fold: the separators are all ASCII, and unlike
+            // `to_lowercase` this cannot shift byte offsets away from `part`.
+            let lower = part.to_ascii_lowercase();
             let mut start = 0usize;
             let mut pieces = Vec::new();
             while let Some(idx) = lower[start..].find(sep) {
@@ -347,7 +349,10 @@ fn strip_feature_marker(segment: &str) -> Option<&str> {
     const MARKERS: &[&str] = &["feat.", "feat", "featuring", "ft.", "ft", "with"];
     let trimmed = segment.trim();
     for marker in MARKERS {
-        if trimmed.len() > marker.len() {
+        // The length compare is in bytes, so the split point can land inside a
+        // multi-byte char: "It’s Love" puts a 3-byte apostrophe across index 4,
+        // which is exactly `"feat".len()`. Check the boundary before splitting.
+        if trimmed.len() > marker.len() && trimmed.is_char_boundary(marker.len()) {
             let (head, tail) = trimmed.split_at(marker.len());
             if head.eq_ignore_ascii_case(marker) && tail.starts_with(|c: char| c.is_whitespace()) {
                 return Some(tail.trim());
@@ -451,7 +456,8 @@ pub fn parse_title(raw: &str) -> ParsedTitle {
 
     // Inline "feat." in the main title, e.g. "Title feat. Someone".
     for marker in [" feat. ", " feat ", " ft. ", " ft ", " featuring "] {
-        let lower = base.to_lowercase();
+        // Byte-offset-preserving fold; see `split_artists`. `idx` indexes `base`.
+        let lower = base.to_ascii_lowercase();
         if let Some(idx) = lower.find(marker) {
             let (head, tail) = base.split_at(idx);
             featured.extend(split_artists(&tail[marker.len()..]));
@@ -546,6 +552,39 @@ mod tests {
     #[test]
     fn featured_guest_does_not_tank_artist_score() {
         assert!(token_set_similarity("Kolsch feat. Nia", "Kolsch") > 0.85);
+    }
+
+    #[test]
+    fn typographic_apostrophe_in_bracket_does_not_panic() {
+        // Regression: `strip_feature_marker` split a bracketed segment at
+        // `"feat".len()` == 4. In "DJ\u{2019}s Mix" the 3-byte apostrophe spans
+        // bytes 2..5, so byte 4 is not a char boundary and the scan worker
+        // panicked. Any "(Xx\u{2019}...)" segment hits this.
+        let p = parse_title("Love (DJ\u{2019}s Mix)");
+        assert_eq!(p.base, "Love (DJ\u{2019}s Mix)");
+
+        let p = parse_title("Love [It\u{2019}s Mine] (Extended Mix)");
+        assert_eq!(p.kind, MixKind::Extended);
+        assert!(p.base.contains("It\u{2019}s Mine"));
+
+        // The guest-clause path still works when the boundary is legal.
+        let p = parse_title("Love (feat. Nia)");
+        assert_eq!(p.featured, vec!["Nia".to_string()]);
+    }
+
+    #[test]
+    fn length_changing_lowercase_does_not_corrupt_offsets() {
+        // `to_lowercase` is not byte-length preserving: '\u{130}' folds to two
+        // chars. Offsets found in a lowercased copy silently mis-sliced the
+        // original, dropping leading characters from the guest name.
+        assert_eq!(
+            split_artists("\u{130}stanbul feat. Ay\u{15f}e"),
+            vec!["\u{130}stanbul".to_string(), "Ay\u{15f}e".to_string()]
+        );
+
+        let p = parse_title("\u{130}stanbul feat. Ay\u{15f}e");
+        assert_eq!(p.base, "\u{130}stanbul");
+        assert_eq!(p.featured, vec!["Ay\u{15f}e".to_string()]);
     }
 
     #[test]
