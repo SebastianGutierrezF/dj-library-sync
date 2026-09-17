@@ -116,6 +116,8 @@ export interface PushResult {
   playlist_name: string;
   added: number;
   skipped: number;
+  /** Present when a duplicate guard could not run. */
+  warning?: string;
 }
 
 export interface PlatformOption {

@@ -623,6 +623,7 @@ export default function App() {
           {result.skipped > 0 && ` · ${result.skipped} already there`}
         </div>
       )}
+      {result?.warning && <div className="banner warn">{result.warning}</div>}
 
       {account.signed_in && config.watch_folder && (
         <>

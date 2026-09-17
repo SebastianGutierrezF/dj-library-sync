@@ -751,6 +751,10 @@ struct PushResult {
     playlist_name: String,
     added: usize,
     skipped: usize,
+    /// Set when a guard could not run. The push still happened; it was just
+    /// protected by fewer checks than usual, and that is worth saying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 /// Whether an identifier plausibly belongs to `platform`.
@@ -799,8 +803,23 @@ async fn push_tracks(
         // reading that as "not mine" would create a duplicate every run.
         .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_writable_by(&me.id));
 
+    // Reading the playlist is one of three duplicate guards, and the only one
+    // that works on a machine whose local log is empty — a reinstall, or a
+    // cleared database. Failing to read it silently left the push looking
+    // fully protected when it was not.
+    let mut warning = None;
     let already = match &existing {
-        Some(p) => client.playlist_entries(&p.id).await.unwrap_or_default(),
+        Some(p) => match client.playlist_entries(&p.id).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("[push] could not read \"{}\": {err:#}", p.name);
+                warning = Some(format!(
+                    "Could not read what is already in \"{}\", so duplicates were only                      checked against this machine's own history. If this playlist was                      filled from another device, some tracks may be added twice.",
+                    p.name
+                ));
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
 
@@ -866,6 +885,7 @@ async fn push_tracks(
         playlist_name: playlist.name,
         added,
         skipped,
+        warning,
     })
 }
 
