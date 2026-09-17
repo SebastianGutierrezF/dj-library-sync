@@ -68,7 +68,10 @@ pub struct AppleClient {
     /// `/me`. Absent for a catalogue-only client.
     music_user_token: Option<String>,
     developer_token: Mutex<Option<CachedDeveloperToken>>,
-    storefront: Mutex<Option<String>>,
+    /// Id and display name together: `current_user` wants the name, and
+    /// caching only the id meant fetching the same document twice on every
+    /// push.
+    storefront: Mutex<Option<Storefront>>,
     last_request: Mutex<Option<Instant>>,
     pub stats: RequestStats,
 }
@@ -286,14 +289,20 @@ impl AppleClient {
         serde_json::from_str(&body).with_context(|| format!("parsing response from {url}"))
     }
 
-    /// The user's storefront, which every catalogue URL is scoped to. Looked
-    /// up once: it cannot change mid-session, and guessing "us" would silently
-    /// match tracks the user cannot actually play.
-    async fn storefront(&self) -> Result<String> {
+    /// The user's storefront, which every catalogue URL is scoped to.
+    ///
+    /// Looked up once: it cannot change mid-session, and guessing "us" would
+    /// silently match tracks the user cannot actually play.
+    ///
+    /// Note that this reads `/v1/me/storefront`, which needs the Music User
+    /// Token — so catalogue search transitively requires one too, even though
+    /// the search request itself does not. A client built without a user token
+    /// cannot search, and says so here rather than failing deeper in.
+    async fn storefront_record(&self) -> Result<Storefront> {
         {
             let cached = self.storefront.lock().await;
-            if let Some(id) = cached.as_ref() {
-                return Ok(id.clone());
+            if let Some(found) = cached.as_ref() {
+                return Ok(found.clone());
             }
         }
 
@@ -301,15 +310,19 @@ impl AppleClient {
             .get_json(&format!("{API_BASE}/v1/me/storefront"), true)
             .await?;
 
-        let id = resp
+        let found = resp
             .data
-            .first()
-            .map(|s| s.id.clone())
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("Apple Music returned no storefront for this account"))?;
 
         let mut cached = self.storefront.lock().await;
-        *cached = Some(id.clone());
-        Ok(id)
+        *cached = Some(found.clone());
+        Ok(found)
+    }
+
+    async fn storefront(&self) -> Result<String> {
+        Ok(self.storefront_record().await?.id)
     }
 
     async fn search_text(&self, term: &str, limit: u32) -> Result<Vec<PlatformTrack>> {
@@ -431,14 +444,14 @@ struct StorefrontResponse {
     data: Vec<Storefront>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Storefront {
     id: String,
     #[serde(default)]
     attributes: Option<StorefrontAttributes>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct StorefrontAttributes {
     #[serde(default)]
     name: Option<String>,
@@ -614,19 +627,11 @@ impl MusicPlatform for AppleClient {
         // Apple exposes no "me" profile — no name, no id, by design. The
         // storefront is the only identifying fact available, and fetching it
         // proves both tokens work, which is what callers actually want.
-        let storefront = self.storefront().await?;
-        let resp: StorefrontResponse = self
-            .get_json(&format!("{API_BASE}/v1/me/storefront"), true)
-            .await?;
-        let name = resp
-            .data
-            .first()
-            .and_then(|s| s.attributes.as_ref())
-            .and_then(|a| a.name.clone());
+        let storefront = self.storefront_record().await?;
 
         Ok(PlatformUser {
-            id: storefront,
-            display_name: name,
+            display_name: storefront.attributes.and_then(|a| a.name),
+            id: storefront.id,
         })
     }
 
@@ -930,6 +935,29 @@ mod tests {
         // does not brick the app.
         let message = OutOfCredits.to_string();
         assert!(message.contains("Spotify is unaffected"), "{message}");
+    }
+
+    #[test]
+    fn a_storefront_carries_its_display_name() {
+        // current_user reads both the id and the name off one document. Before,
+        // it fetched the same document twice on every push.
+        let resp: StorefrontResponse = serde_json::from_str(
+            r#"{"data":[{"id":"mx","type":"storefronts","attributes":{"name":"Mexico"}}]}"#,
+        )
+        .unwrap();
+        let first = resp.data.first().unwrap();
+        assert_eq!(first.id, "mx");
+        assert_eq!(
+            first.attributes.as_ref().and_then(|a| a.name.as_deref()),
+            Some("Mexico")
+        );
+    }
+
+    #[test]
+    fn a_storefront_without_attributes_still_identifies_the_account() {
+        let resp: StorefrontResponse =
+            serde_json::from_str(r#"{"data":[{"id":"us","type":"storefronts"}]}"#).unwrap();
+        assert_eq!(resp.data.first().unwrap().id, "us");
     }
 
     #[test]

@@ -2,36 +2,56 @@
 
 What is deliberately not done at v0.1.0, and why. Ordered by what blocks what.
 
-## Blocked on the Apple Developer Program
+## Built but never run against Apple
 
-Enrollment is pending; one membership unlocks both items.
+The adapter, the licence flow and the sync path are written and tested against
+fixtures. **No call has ever been made to Apple's real API**, and the hosted
+MusicKit page has never been loaded in a browser. Every field name in
+`apple.rs` came from documentation rather than an observed response;
+`durationInMillis` was already silently parsing as zero before a test caught
+it, and the ones that survived are simply the ones no test disproved.
 
-- **Apple Music adapter** — implement `MusicPlatform` for Apple Music. The auth
-  design is settled in [apple-music-auth.md](apple-music-auth.md); the adapter
-  itself is unwritten. Note Apple's catalogue is per *storefront*, which must be
-  resolved per user rather than assumed — it is mandatory where Spotify's
-  `market` is optional.
-- **Signed and notarised macOS builds.** Until then Gatekeeper tells testers the
-  app is damaged. The release workflow already reads six `APPLE_*` secrets; they
-  just do not exist yet.
-- **Apple credentials on the token service** — `APPLE_TEAM_ID`, `APPLE_KEY_ID`,
-  `APPLE_PRIVATE_KEY`. `/readyz` reports them red until set.
+The go-live sequence, and the failure modes to expect at each step, are in
+[go-live.md](go-live.md).
 
 ## Needed before anyone can pay
 
-- **Decide where `userId` comes from.** The token service trusts whatever the
-  desktop app sends. It needs to be stable and unguessable — a licence key
-  issued at purchase, not an email or an install id — because anyone who knows
-  a `userId` can spend that balance. This is the single most important open
-  decision.
-- **The desktop app does not talk to the token service at all.** No licence
-  storage, no `/api/developer-token` call, no usage reporting. Nothing is wired.
-- **No way to buy credits.** unified-pay can take a payment and top up a
-  balance; nothing in this product initiates that.
-- **Rate limiting on the token service.** A leaked `userId` can currently
-  request tokens without limit.
+- **Rate limiting on `/api/trial` and `/api/activate`.** Nothing stops a script
+  claiming trials for invented device ids, and each one writes a credit grant
+  into unified-pay's ledger. This is now the most important open item: it is
+  abuse of the billing system, not just of the product.
+- **No buy button.** `POST /api/checkout` exists and works; the landing page
+  still says "Coming soon" and nothing calls it. Waiting on Apple being proven
+  and on prices being set.
+- **No account page.** A seat cannot be freed without editing the database, so
+  a user who reinstalls three times is stuck.
+- **Licence recovery.** Only the hash is stored, so a lost key cannot be
+  reissued. Deliberate — it is what avoids storing keys in the clear or running
+  email infrastructure — but it needs an answer before real customers exist.
+- **unified-pay grants a credit per dollar on the first payment only**, on top
+  of the plan grant, so month one differs from every month after. Either price
+  so the two agree, or add a per-tenant flag there to skip it.
+
+## Settled
+
+- **Where `userId` comes from** — a licence key issued at purchase, exchanged
+  for a short-lived activation token the machine uses thereafter. The client no
+  longer names itself; the identity is read out of a signature this service
+  produced. Design and rationale in the service repo's
+  `docs/billing-identity.md`.
+- **The Apple Music adapter**, the licence flow in the desktop app, and the
+  platform-agnostic sync path. See "Built but never run against Apple" above.
+- **Signed and notarised macOS builds** — shipping since v0.1.1.
 
 ## Correctness and coverage
+
+- **macOS 12 refuses the signed installer.** Finder shows the prohibitory badge
+  and refuses to launch, although the binary runs fine when invoked directly
+  and reports `minos 10.13`, a valid signature and a notarised Gatekeeper
+  verdict. Untested hypothesis: pinning `MACOSX_DEPLOYMENT_TARGET` in the
+  release workflow, since the runner builds against the macOS 26 SDK.
+- **`RELEASE_REPO` still names `dj-library-sync`.** The repository was renamed
+  to `synccrate`; downloads work only because GitHub redirects.
 
 - **Cached rows cannot be reviewed.** Candidates are not persisted, so a row
   restored from the database offers no alternatives and the review UI shows
