@@ -390,7 +390,7 @@ export default function App() {
             <h1>Services</h1>
             <p className="dim intro">
               {mustConnect
-                ? "Pick where your new downloads should end up."
+                ? "Pick where your new tracks should end up."
                 : "Connect another service, or change how one is set up."}
             </p>
           </div>
@@ -654,7 +654,7 @@ export default function App() {
       {!busy && pending.length > 0 && (
         <div className="banner good arrivals">
           <span>
-            {pending.length} new {pending.length === 1 ? "download" : "downloads"} landed
+            {pending.length} new {pending.length === 1 ? "track" : "tracks"} landed
             <span className="dim small"> — {pending.slice(-3).join(", ")}</span>
           </span>
           <button onClick={() => runMatch(false)}>Match them</button>
@@ -686,7 +686,7 @@ export default function App() {
           </div>
 
           <div className="toolbar">
-            <button onClick={() => runMatch(false)} disabled={!!busy}>Match new downloads</button>
+            <button onClick={() => runMatch(false)} disabled={!!busy}>Match new tracks</button>
             <button className="ghost" onClick={() => runMatch(true)} disabled={!!busy}>
               Re-check everything
             </button>
