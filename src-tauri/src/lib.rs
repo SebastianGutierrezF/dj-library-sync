@@ -559,11 +559,26 @@ struct MatchRow {
     confidence: f32,
     reason: String,
     candidates: Vec<Candidate>,
+    /// The match already stored for this track, present only on a cached row.
+    ///
+    /// Candidates are not persisted, so without this a cached row carried no
+    /// identifier at all and could not be pushed — which made every run after
+    /// the first look like it had nothing to do.
+    stored: Option<StoredChoice>,
     /// Set when the search itself failed, as opposed to finding nothing. The
     /// difference matters: one is worth retrying, the other is not.
     error: Option<String>,
     /// True when this came from the local database rather than a fresh query.
     cached: bool,
+}
+
+/// Enough of a stored match to push it again without re-querying.
+#[derive(Serialize, Clone)]
+struct StoredChoice {
+    uri: String,
+    name: String,
+    artists: String,
+    duration_ms: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -605,6 +620,15 @@ async fn match_folder(
 
         if !rescan && record.can_reuse_match() {
             if let Ok(Some(stored)) = db.stored_match(record.id, &platform) {
+                // No alternatives — those need a re-check — but the match
+                // itself is enough to push again.
+                let choice = stored.platform_uri.clone().map(|uri| StoredChoice {
+                    uri,
+                    name: stored.platform_name.clone().unwrap_or_default(),
+                    artists: stored.platform_artists.clone().unwrap_or_default(),
+                    duration_ms: stored.platform_duration_ms.unwrap_or(0),
+                });
+
                 rows.push(MatchRow {
                     track_id: record.id,
                     track,
@@ -612,9 +636,8 @@ async fn match_folder(
                     method: stored.method,
                     confidence: stored.confidence,
                     reason: stored.reason,
-                    // Candidates are not persisted, so a cached row cannot
-                    // offer alternatives; re-scan to get them back.
                     candidates: Vec::new(),
+                    stored: choice,
                     error: None,
                     cached: true,
                 });
@@ -687,6 +710,7 @@ async fn match_folder(
             confidence: outcome.confidence(),
             reason: outcome.reason.clone(),
             candidates: outcome.candidates,
+            stored: None,
             error: search_error,
             cached: false,
         });

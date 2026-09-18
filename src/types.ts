@@ -85,6 +85,11 @@ export interface MatchRow {
   confidence: number;
   reason: string;
   candidates: Candidate[];
+  /**
+   * The stored match, on a cached row. Candidates are not persisted, so this
+   * is what makes a cached row pushable.
+   */
+  stored: StoredChoice | null;
   /** Set when the search failed, as opposed to finding nothing. */
   error: string | null;
   cached: boolean;
@@ -141,4 +146,12 @@ export interface LicenceStatus {
   apple_connected: boolean;
   /** A warning, not a failure — Spotify keeps working regardless. */
   error: string | null;
+}
+
+/** Enough of a stored match to push it again without re-querying. */
+export interface StoredChoice {
+  uri: string;
+  name: string;
+  artists: string;
+  duration_ms: number;
 }

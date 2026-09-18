@@ -18,6 +18,24 @@ import type {
 
 const DERIVATIVE: MixKind[] = ["Remix", "Rework", "Edit", "Vip"];
 
+const SECTIONS = [
+  {
+    verdict: "auto",
+    title: "Ready",
+    hint: "Confident matches. Nothing here needs a decision.",
+  },
+  {
+    verdict: "review",
+    title: "Needs a look",
+    hint: "Close enough to be worth checking, not close enough to assume. Expand a row to see the alternatives.",
+  },
+  {
+    verdict: "no_match",
+    title: "Not found",
+    hint: "Nothing convincing in the catalogue. Expand a row in case one of the near misses is right after all.",
+  },
+] as const;
+
 function descriptorLabel(track: LocalTrack): string {
   const { kind, remixer } = track.parsed;
   if (remixer && DERIVATIVE.includes(kind)) return `${remixer} ${kind.toLowerCase()}`;
@@ -75,6 +93,13 @@ export default function App() {
     setAccount(await invoke<AccountStatus>("account_status"));
     setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
+
+  /**
+   * Split by verdict so each can be acted on alone: push the confident ones
+   * now, come back to the rest. Ready is open by default because it is the
+   * one that usually needs no decision.
+   */
+  const [openSections, setOpenSections] = useState<Set<string>>(new Set(["auto"]));
 
   /** Rows whose search errored, which is not the same as finding nothing. */
   const searchFailures = useMemo(() => rows.filter((r) => r.error).length, [rows]);
@@ -227,9 +252,15 @@ export default function App() {
         // Confident matches are pre-selected; everything else waits for a
         // decision, which is the entire point of the verdict split.
         setSelected(new Set(found.filter((r) => r.verdict === "auto").map((r) => r.track_id)));
+        // A cached row has no candidates but does carry its stored match, and
+        // that is the whole point of it: the second run should be able to push
+        // what the first one found.
         setChosen(
           Object.fromEntries(
-            found.flatMap((r) => (r.candidates[0] ? [[r.track_id, r.candidates[0].track.uri]] : []))
+            found.flatMap((r) => {
+              const uri = r.candidates[0]?.track.uri ?? r.stored?.uri;
+              return uri ? [[r.track_id, uri]] : [];
+            })
           )
         );
       } catch (err) {
@@ -250,58 +281,78 @@ export default function App() {
     }
   }, []);
 
-  const push = useCallback(async () => {
-    const items = rows
-      .filter((r) => selected.has(r.track_id))
-      .flatMap((r) => {
-        const uri = chosen[r.track_id];
-        const c = r.candidates.find((x) => x.track.uri === uri);
+  /**
+   * The rows that can actually be sent: selected, with a choice resolvable
+   * against this row's own candidates or its stored match.
+   */
+  const buildItems = useCallback(
+    (subset: MatchRow[]) =>
+      subset
+        .filter((r) => selected.has(r.track_id))
+        .flatMap((r) => {
+          const uri = chosen[r.track_id];
+          if (!uri) return [];
 
-        // A choice that is not among this row's own candidates belongs to an
-        // earlier run. Sending it anyway pushed a stale URI with blank
-        // metadata, which also defeats the duplicate check on the way in.
-        if (!uri || !c) return [];
+          // Resolve against this row's own candidates, or its stored match
+          // when it came from the cache. A URI matching neither belongs to an
+          // earlier run: sending it pushed a stale id with blank metadata,
+          // which also defeats the duplicate check on the way in.
+          const c = r.candidates.find((x) => x.track.uri === uri);
+          const choice = c
+            ? {
+                // Sent so the backend can spot the same recording under a
+                // different id, not just an identical one.
+                name: c.track.name,
+                artists: c.track.artists.join(", "),
+                duration_ms: c.track.duration_ms,
+              }
+            : r.stored?.uri === uri
+            ? {
+                name: r.stored.name,
+                artists: r.stored.artists,
+                duration_ms: r.stored.duration_ms,
+              }
+            : null;
 
-        return [
-          {
-            track_id: r.track_id,
-            uri,
-            // Sent so the backend can spot the same recording under a
-            // different id, not just an identical one.
-            name: c.track.name,
-            artists: c.track.artists.join(", "),
-            duration_ms: c.track.duration_ms,
-          },
-        ];
-      });
+          return choice ? [{ track_id: r.track_id, uri, ...choice }] : [];
+        }),
+    [selected, chosen],
+  );
 
-    if (items.length === 0 || !config) return;
+  const push = useCallback(
+    async (subset: MatchRow[]) => {
+      const items = buildItems(subset);
+      if (items.length === 0 || !config) return;
 
-    setBusy(`Adding ${items.length} track(s)…`);
-    setError(null);
-    try {
-      const res = await invoke<PushResult>("push_tracks", {
-        playlistName,
-        platform: target,
-        items,
-      });
-      // The balance moved if this was a metered platform.
-      void refreshLicence();
-      setResult(res);
-      await persist({ ...config, last_playlist: playlistName });
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(null);
-    }
-  }, [rows, selected, chosen, playlistName, config, persist]);
+      setBusy(`Adding ${items.length} track(s)…`);
+      setError(null);
+      try {
+        const res = await invoke<PushResult>("push_tracks", {
+          playlistName,
+          platform: target,
+          items,
+        });
+        // The balance moved if this was a metered platform.
+        void refreshLicence();
+        setResult(res);
+        await persist({ ...config, last_playlist: playlistName });
+      } catch (err) {
+        setError(String(err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [buildItems, playlistName, config, persist, target, refreshLicence],
+  );
 
   const stats = useMemo(() => {
     const by = (v: string) => rows.filter((r) => r.verdict === v).length;
     return { total: rows.length, auto: by("auto"), review: by("review"), missing: by("no_match") };
   }, [rows]);
 
-  const readyToPush = rows.filter((r) => selected.has(r.track_id) && chosen[r.track_id]).length;
+  /** The service being pushed to, for labels that used to say "Spotify". */
+  const targetName =
+    connectedTargets.find((p) => p.id === target)?.display_name ?? "your library";
 
   if (bootError) {
     return (
@@ -613,7 +664,7 @@ export default function App() {
       {searchFailures > 0 && (
         <div className="banner error">
           {searchFailures} of {rows.length} searches failed, so those rows say nothing
-          about whether the tracks exist on {target === "apple_music" ? "Apple Music" : "Spotify"}.
+          about whether the tracks exist on {targetName}.
           Nothing was saved for them — fix the cause and run it again.
         </div>
       )}
@@ -645,7 +696,7 @@ export default function App() {
                 checked={config.accept_shorter}
                 onChange={(e) => persist({ ...config, accept_shorter: e.target.checked })}
               />
-              Accept the shorter cut when the extended mix isn’t on Spotify
+              Accept the shorter cut when the extended mix isn’t available
             </label>
           </div>
         </>
@@ -653,36 +704,6 @@ export default function App() {
 
       {rows.length > 0 && (
         <>
-          <table>
-            <thead>
-              <tr>
-                <th className="tick"></th>
-                <th>Track</th>
-                <th>Version</th>
-                <th>Match on Spotify</th>
-                <th className="num">Conf.</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <RowView
-                  key={row.track_id}
-                  row={row}
-                  checked={selected.has(row.track_id)}
-                  chosenUri={chosen[row.track_id]}
-                  onToggle={() =>
-                    setSelected((prev) => {
-                      const next = new Set(prev);
-                      next.has(row.track_id) ? next.delete(row.track_id) : next.add(row.track_id);
-                      return next;
-                    })
-                  }
-                  onChoose={(uri) => setChosen((prev) => ({ ...prev, [row.track_id]: uri }))}
-                />
-              ))}
-            </tbody>
-          </table>
-
           <div className="pushbar">
             <input
               list="playlists"
@@ -696,10 +717,111 @@ export default function App() {
                 <option key={p.id} value={p.name} />
               ))}
             </datalist>
-            <button onClick={push} disabled={!!busy || readyToPush === 0 || !playlistName.trim()}>
-              Add {readyToPush} to playlist
-            </button>
+            <span className="dim small">{targetName}</span>
           </div>
+
+          {SECTIONS.map((section) => {
+            const sectionRows = rows.filter((r) => r.verdict === section.verdict);
+            if (sectionRows.length === 0) return null;
+
+            const open = openSections.has(section.verdict);
+            const ready = buildItems(sectionRows).length;
+            // Only rows with a resolvable choice can be selected usefully.
+            const selectable = sectionRows.filter(
+              (r) => r.candidates.length > 0 || r.stored,
+            );
+            const allSelected =
+              selectable.length > 0 && selectable.every((r) => selected.has(r.track_id));
+
+            return (
+              <section key={section.verdict} className={`group ${section.verdict}`}>
+                <header className="group-head">
+                  <button
+                    className="group-toggle"
+                    aria-expanded={open}
+                    onClick={() =>
+                      setOpenSections((prev) => {
+                        const next = new Set(prev);
+                        next.has(section.verdict)
+                          ? next.delete(section.verdict)
+                          : next.add(section.verdict);
+                        return next;
+                      })
+                    }
+                  >
+                    <span className="chevron" aria-hidden="true">
+                      {open ? "▾" : "▸"}
+                    </span>
+                    <span className="group-title">{section.title}</span>
+                    <span className="pill">{sectionRows.length}</span>
+                  </button>
+
+                  <div className="group-actions">
+                    {selectable.length > 0 && (
+                      <button
+                        className="ghost"
+                        onClick={() =>
+                          setSelected((prev) => {
+                            const next = new Set(prev);
+                            for (const r of selectable) {
+                              allSelected ? next.delete(r.track_id) : next.add(r.track_id);
+                            }
+                            return next;
+                          })
+                        }
+                      >
+                        {allSelected ? "Deselect all" : "Select all"}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => push(sectionRows)}
+                      disabled={!!busy || ready === 0 || !playlistName.trim()}
+                    >
+                      Add {ready}
+                    </button>
+                  </div>
+                </header>
+
+                <p className="group-hint dim small">{section.hint}</p>
+
+                {open && (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th className="tick"></th>
+                        <th>Track</th>
+                        <th>Version</th>
+                        <th>Match</th>
+                        <th className="num">Conf.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sectionRows.map((row) => (
+                        <RowView
+                          key={row.track_id}
+                          row={row}
+                          checked={selected.has(row.track_id)}
+                          chosenUri={chosen[row.track_id]}
+                          onToggle={() =>
+                            setSelected((prev) => {
+                              const next = new Set(prev);
+                              next.has(row.track_id)
+                                ? next.delete(row.track_id)
+                                : next.add(row.track_id);
+                              return next;
+                            })
+                          }
+                          onChoose={(uri) =>
+                            setChosen((prev) => ({ ...prev, [row.track_id]: uri }))
+                          }
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </section>
+            );
+          })}
         </>
       )}
     </div>

@@ -283,3 +283,37 @@ button.link {
    argument's specificity, so the generic rule outranks a plain .banner.warn
    and the amber would never show. */
 .banner.warn { background: rgba(251, 191, 36, 0.12); color: #fbbf24; }
+
+/* Verdict groups. Each is independently collapsible and independently
+   pushable, so a confident batch can go out while the rest waits. */
+.group { margin-top: 20px; }
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 6px;
+}
+.group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.group-toggle:hover { color: var(--accent); }
+.chevron { color: var(--dim); font-size: 11px; width: 10px; }
+.group-title { letter-spacing: -0.01em; }
+.group-actions { display: flex; align-items: center; gap: 8px; }
+.group-hint { margin: 0 0 10px 18px; max-width: 52ch; }
+
+/* The verdict already colours each row; a left rule ties the group to it
+   without repeating the fill. */
+.group.auto .group-title { color: var(--accent); }
+.group.no_match .group-title { color: var(--dim); }
