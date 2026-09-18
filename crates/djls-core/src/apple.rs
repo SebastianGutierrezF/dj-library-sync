@@ -68,7 +68,10 @@ pub struct AppleClient {
     /// `/me`. Absent for a catalogue-only client.
     music_user_token: Option<String>,
     developer_token: Mutex<Option<CachedDeveloperToken>>,
-    storefront: Mutex<Option<String>>,
+    /// Id and display name together: `current_user` wants the name, and
+    /// caching only the id meant fetching the same document twice on every
+    /// push.
+    storefront: Mutex<Option<Storefront>>,
     last_request: Mutex<Option<Instant>>,
     pub stats: RequestStats,
 }
@@ -167,9 +170,16 @@ impl AppleClient {
         }
 
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct TokenResponse {
             token: String,
             /// RFC 3339. Only used to decide when to ask again.
+            ///
+            /// Optional, so a missing value falls back rather than failing —
+            /// which is exactly why the camelCase mismatch here went unnoticed
+            /// while the same bug in `licence` announced itself. Every token
+            /// was being cached for the default hour regardless of what the
+            /// service said.
             #[serde(default)]
             expires_at: Option<String>,
         }
@@ -286,14 +296,20 @@ impl AppleClient {
         serde_json::from_str(&body).with_context(|| format!("parsing response from {url}"))
     }
 
-    /// The user's storefront, which every catalogue URL is scoped to. Looked
-    /// up once: it cannot change mid-session, and guessing "us" would silently
-    /// match tracks the user cannot actually play.
-    async fn storefront(&self) -> Result<String> {
+    /// The user's storefront, which every catalogue URL is scoped to.
+    ///
+    /// Looked up once: it cannot change mid-session, and guessing "us" would
+    /// silently match tracks the user cannot actually play.
+    ///
+    /// Note that this reads `/v1/me/storefront`, which needs the Music User
+    /// Token — so catalogue search transitively requires one too, even though
+    /// the search request itself does not. A client built without a user token
+    /// cannot search, and says so here rather than failing deeper in.
+    async fn storefront_record(&self) -> Result<Storefront> {
         {
             let cached = self.storefront.lock().await;
-            if let Some(id) = cached.as_ref() {
-                return Ok(id.clone());
+            if let Some(found) = cached.as_ref() {
+                return Ok(found.clone());
             }
         }
 
@@ -301,15 +317,19 @@ impl AppleClient {
             .get_json(&format!("{API_BASE}/v1/me/storefront"), true)
             .await?;
 
-        let id = resp
+        let found = resp
             .data
-            .first()
-            .map(|s| s.id.clone())
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("Apple Music returned no storefront for this account"))?;
 
         let mut cached = self.storefront.lock().await;
-        *cached = Some(id.clone());
-        Ok(id)
+        *cached = Some(found.clone());
+        Ok(found)
+    }
+
+    async fn storefront(&self) -> Result<String> {
+        Ok(self.storefront_record().await?.id)
     }
 
     async fn search_text(&self, term: &str, limit: u32) -> Result<Vec<PlatformTrack>> {
@@ -342,6 +362,27 @@ impl AppleClient {
 
         Ok(all)
     }
+}
+
+/// How hard to look for a playlist Apple has accepted but not yet listed.
+const CREATE_LOOKUP_ATTEMPTS: u32 = 4;
+const CREATE_LOOKUP_DELAY: Duration = Duration::from_millis(700);
+
+/// The created playlist, when Apple bothered to return one.
+///
+/// Separate so the empty-body case is testable without a network: an empty or
+/// non-JSON body is a normal successful response here, not a failure, and
+/// treating it as a parse error failed a push whose playlist had been created.
+fn parse_created_playlist(body: &str) -> Option<PlatformPlaylist> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<LibraryPage<LibraryPlaylist>>(body)
+        .ok()?
+        .data
+        .into_iter()
+        .next()
+        .map(LibraryPlaylist::into_playlist)
 }
 
 /// Turn Apple's status codes into something that names the actual fix.
@@ -431,14 +472,14 @@ struct StorefrontResponse {
     data: Vec<Storefront>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Storefront {
     id: String,
     #[serde(default)]
     attributes: Option<StorefrontAttributes>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct StorefrontAttributes {
     #[serde(default)]
     name: Option<String>,
@@ -614,19 +655,11 @@ impl MusicPlatform for AppleClient {
         // Apple exposes no "me" profile — no name, no id, by design. The
         // storefront is the only identifying fact available, and fetching it
         // proves both tokens work, which is what callers actually want.
-        let storefront = self.storefront().await?;
-        let resp: StorefrontResponse = self
-            .get_json(&format!("{API_BASE}/v1/me/storefront"), true)
-            .await?;
-        let name = resp
-            .data
-            .first()
-            .and_then(|s| s.attributes.as_ref())
-            .and_then(|a| a.name.clone());
+        let storefront = self.storefront_record().await?;
 
         Ok(PlatformUser {
-            id: storefront,
-            display_name: name,
+            display_name: storefront.attributes.and_then(|a| a.name),
+            id: storefront.id,
         })
     }
 
@@ -680,6 +713,26 @@ impl MusicPlatform for AppleClient {
     }
 
     async fn create_playlist(&self, name: &str, _public: bool) -> Result<PlatformPlaylist> {
+        // Creating by name is idempotent here, deliberately.
+        //
+        // Apple's library is eventually consistent, so a playlist created a
+        // moment ago may not be in the list the caller checked before deciding
+        // to create one. That is how two playlists with the same name appeared:
+        // one run created it and then failed on the empty response body, and
+        // the next run could not yet see it.
+        //
+        // The cost is that two playlists genuinely meant to share a name cannot
+        // be made from here. They are named by date, so that is not a case this
+        // app produces.
+        if let Some(existing) = self
+            .list_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(existing);
+        }
+
         // `public` is ignored on purpose: Apple's library playlist API has no
         // such attribute. Accepting it and doing nothing is better than
         // changing the trait for one platform's omission.
@@ -696,14 +749,33 @@ impl MusicPlatform for AppleClient {
             )
             .await?;
 
-        let resp: LibraryPage<LibraryPlaylist> =
-            serde_json::from_str(&text).context("parsing the created playlist")?;
+        // Apple accepts the write and frequently answers with an empty body —
+        // library mutations are applied asynchronously, so there is nothing to
+        // echo back yet. Parse the playlist when it is there.
+        if let Some(created) = parse_created_playlist(&text) {
+            return Ok(created);
+        }
 
-        resp.data
-            .into_iter()
-            .next()
-            .map(LibraryPlaylist::into_playlist)
-            .ok_or_else(|| anyhow!("Apple Music created the playlist but returned nothing"))
+        // Otherwise find it by name. The library is eventually consistent, so
+        // it may take a moment to appear; a few short waits beat failing a
+        // push that actually succeeded.
+        for attempt in 0..CREATE_LOOKUP_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CREATE_LOOKUP_DELAY).await;
+            }
+            if let Some(found) = self
+                .list_playlists()
+                .await?
+                .into_iter()
+                .find(|p| p.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(found);
+            }
+        }
+
+        Err(anyhow!(
+            "Apple Music accepted the new playlist \"{name}\" but it has not appeared in              the library yet. It may show up shortly — try the push again."
+        ))
     }
 
     async fn playlist_entries(&self, playlist_id: &str) -> Result<Vec<PlatformEntry>> {
@@ -930,6 +1002,56 @@ mod tests {
         // does not brick the app.
         let message = OutOfCredits.to_string();
         assert!(message.contains("Spotify is unaffected"), "{message}");
+    }
+
+    #[test]
+    fn a_storefront_carries_its_display_name() {
+        // current_user reads both the id and the name off one document. Before,
+        // it fetched the same document twice on every push.
+        let resp: StorefrontResponse = serde_json::from_str(
+            r#"{"data":[{"id":"mx","type":"storefronts","attributes":{"name":"Mexico"}}]}"#,
+        )
+        .unwrap();
+        let first = resp.data.first().unwrap();
+        assert_eq!(first.id, "mx");
+        assert_eq!(
+            first.attributes.as_ref().and_then(|a| a.name.as_deref()),
+            Some("Mexico")
+        );
+    }
+
+    #[test]
+    fn a_storefront_without_attributes_still_identifies_the_account() {
+        let resp: StorefrontResponse =
+            serde_json::from_str(r#"{"data":[{"id":"us","type":"storefronts"}]}"#).unwrap();
+        assert_eq!(resp.data.first().unwrap().id, "us");
+    }
+
+    #[test]
+    fn an_empty_create_response_is_not_a_failure() {
+        // Apple applies library writes asynchronously and answers with an
+        // empty body. Treating that as a parse error — "expected value at line
+        // 1 column 1" — failed a push whose playlist had in fact been created.
+        assert!(parse_created_playlist("").is_none());
+        assert!(parse_created_playlist("   \n ").is_none());
+        // Not JSON at all is the same situation, not a reason to give up.
+        assert!(parse_created_playlist("Accepted").is_none());
+    }
+
+    #[test]
+    fn a_create_response_with_the_playlist_is_used_directly() {
+        let created = parse_created_playlist(
+            r#"{"data":[{"id":"p.abc","type":"library-playlists",
+                "attributes":{"name":"New Downloads 2026-09-17","canEdit":true}}]}"#,
+        )
+        .expect("a populated response should parse");
+        assert_eq!(created.id, "p.abc");
+        assert_eq!(created.name, "New Downloads 2026-09-17");
+    }
+
+    #[test]
+    fn a_response_with_an_empty_data_array_falls_back_too() {
+        assert!(parse_created_playlist(r#"{"data":[]}"#).is_none());
     }
 
     #[test]

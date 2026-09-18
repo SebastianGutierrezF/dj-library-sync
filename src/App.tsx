@@ -18,6 +18,24 @@ import type {
 
 const DERIVATIVE: MixKind[] = ["Remix", "Rework", "Edit", "Vip"];
 
+const SECTIONS = [
+  {
+    verdict: "auto",
+    title: "Ready",
+    hint: "Confident matches. Nothing here needs a decision.",
+  },
+  {
+    verdict: "review",
+    title: "Needs a look",
+    hint: "Close enough to be worth checking, not close enough to assume. Expand a row to see the alternatives.",
+  },
+  {
+    verdict: "no_match",
+    title: "Not found",
+    hint: "Nothing convincing in the catalogue. Expand a row in case one of the near misses is right after all.",
+  },
+] as const;
+
 function descriptorLabel(track: LocalTrack): string {
   const { kind, remixer } = track.parsed;
   if (remixer && DERIVATIVE.includes(kind)) return `${remixer} ${kind.toLowerCase()}`;
@@ -43,6 +61,16 @@ export default function App() {
   const [redirect, setRedirect] = useState<string>("");
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
   const [connecting, setConnecting] = useState<string | null>(null);
+  /** The services screen was a dead end: it only rendered when nothing was
+   *  connected, so once Spotify was set up there was no way back to it to add
+   *  or change anything. It is a mode now, reachable from the header. */
+  const [showServices, setShowServices] = useState(false);
+  /**
+   * Which service the sync path talks to. Spotify unless Apple Music is fully
+   * connected, because Apple needs both a licence and a Music User Token and
+   * defaulting to it would fail on first use for everyone else.
+   */
+  const [target, setTarget] = useState<string>("spotify");
   const [licence, setLicence] = useState<LicenceStatus | null>(null);
   const [licenceDraft, setLicenceDraft] = useState("");
   const [licenceBusy, setLicenceBusy] = useState(false);
@@ -65,6 +93,22 @@ export default function App() {
     setAccount(await invoke<AccountStatus>("account_status"));
     setPlatforms(await invoke<PlatformOption[]>("available_platforms"));
   }, []);
+
+  /**
+   * Split by verdict so each can be acted on alone: push the confident ones
+   * now, come back to the rest. Ready is open by default because it is the
+   * one that usually needs no decision.
+   */
+  const [openSections, setOpenSections] = useState<Set<string>>(new Set(["auto"]));
+
+  /** Rows whose search errored, which is not the same as finding nothing. */
+  const searchFailures = useMemo(() => rows.filter((r) => r.error).length, [rows]);
+
+  /** Platforms actually usable right now — the only ones worth offering. */
+  const connectedTargets = useMemo(
+    () => platforms.filter((p) => p.available && p.connected),
+    [platforms],
+  );
 
   const refreshLicence = useCallback(async () => {
     try {
@@ -91,6 +135,16 @@ export default function App() {
     },
     [refreshAccount],
   );
+
+  // Keep the target on something that works. If the current one is
+  // disconnected — a licence cleared, Apple signed out — fall back rather than
+  // leaving the app pointed at a service it cannot reach.
+  useEffect(() => {
+    if (connectedTargets.length === 0) return;
+    if (!connectedTargets.some((p) => p.id === target)) {
+      setTarget(connectedTargets[0].id);
+    }
+  }, [connectedTargets, target]);
 
   const [bootError, setBootError] = useState<string | null>(null);
 
@@ -174,11 +228,21 @@ export default function App() {
   const runMatch = useCallback(
     async (rescan: boolean) => {
       if (!config?.watch_folder) return;
-      setBusy(rescan ? "Re-querying Spotify…" : "Matching…");
+      setBusy(rescan ? "Re-checking everything…" : "Matching…");
       setError(null);
+
+      // Cleared before the run, not after it. All of these are keyed by the
+      // local track id, which is identical on every platform, so results that
+      // survived a failed run looked current and could be pushed to a service
+      // they were never matched against.
+      setRows([]);
+      setSelected(new Set());
+      setChosen({});
       setResult(null);
+
       try {
         const found = await invoke<MatchRow[]>("match_folder", {
+          platform: target,
           path: config.watch_folder,
           acceptShorter: config.accept_shorter,
           rescan,
@@ -188,9 +252,15 @@ export default function App() {
         // Confident matches are pre-selected; everything else waits for a
         // decision, which is the entire point of the verdict split.
         setSelected(new Set(found.filter((r) => r.verdict === "auto").map((r) => r.track_id)));
+        // A cached row has no candidates but does carry its stored match, and
+        // that is the whole point of it: the second run should be able to push
+        // what the first one found.
         setChosen(
           Object.fromEntries(
-            found.flatMap((r) => (r.candidates[0] ? [[r.track_id, r.candidates[0].track.uri]] : []))
+            found.flatMap((r) => {
+              const uri = r.candidates[0]?.track.uri ?? r.stored?.uri;
+              return uri ? [[r.track_id, uri]] : [];
+            })
           )
         );
       } catch (err) {
@@ -205,51 +275,84 @@ export default function App() {
 
   const loadPlaylists = useCallback(async () => {
     try {
-      setPlaylists(await invoke<PlaylistInfo[]>("list_playlists"));
+      setPlaylists(await invoke<PlaylistInfo[]>("list_playlists", { platform: target }));
     } catch (err) {
       setError(String(err));
     }
   }, []);
 
-  const push = useCallback(async () => {
-    const items = rows
-      .filter((r) => selected.has(r.track_id))
-      .map((r) => {
-        const uri = chosen[r.track_id];
-        const c = r.candidates.find((x) => x.track.uri === uri);
-        return {
-          track_id: r.track_id,
-          uri,
-          // Sent so the backend can spot the same recording under a
-          // different Spotify URI, not just an identical one.
-          name: c?.track.name ?? "",
-          artists: c?.track.artists.join(", ") ?? "",
-          duration_ms: c?.track.duration_ms ?? 0,
-        };
-      })
-      .filter((i) => Boolean(i.uri));
+  /**
+   * The rows that can actually be sent: selected, with a choice resolvable
+   * against this row's own candidates or its stored match.
+   */
+  const buildItems = useCallback(
+    (subset: MatchRow[]) =>
+      subset
+        .filter((r) => selected.has(r.track_id))
+        .flatMap((r) => {
+          const uri = chosen[r.track_id];
+          if (!uri) return [];
 
-    if (items.length === 0 || !config) return;
+          // Resolve against this row's own candidates, or its stored match
+          // when it came from the cache. A URI matching neither belongs to an
+          // earlier run: sending it pushed a stale id with blank metadata,
+          // which also defeats the duplicate check on the way in.
+          const c = r.candidates.find((x) => x.track.uri === uri);
+          const choice = c
+            ? {
+                // Sent so the backend can spot the same recording under a
+                // different id, not just an identical one.
+                name: c.track.name,
+                artists: c.track.artists.join(", "),
+                duration_ms: c.track.duration_ms,
+              }
+            : r.stored?.uri === uri
+            ? {
+                name: r.stored.name,
+                artists: r.stored.artists,
+                duration_ms: r.stored.duration_ms,
+              }
+            : null;
 
-    setBusy(`Adding ${items.length} track(s)…`);
-    setError(null);
-    try {
-      const res = await invoke<PushResult>("push_tracks", { playlistName, items });
-      setResult(res);
-      await persist({ ...config, last_playlist: playlistName });
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(null);
-    }
-  }, [rows, selected, chosen, playlistName, config, persist]);
+          return choice ? [{ track_id: r.track_id, uri, ...choice }] : [];
+        }),
+    [selected, chosen],
+  );
+
+  const push = useCallback(
+    async (subset: MatchRow[]) => {
+      const items = buildItems(subset);
+      if (items.length === 0 || !config) return;
+
+      setBusy(`Adding ${items.length} track(s)…`);
+      setError(null);
+      try {
+        const res = await invoke<PushResult>("push_tracks", {
+          playlistName,
+          platform: target,
+          items,
+        });
+        // The balance moved if this was a metered platform.
+        void refreshLicence();
+        setResult(res);
+        await persist({ ...config, last_playlist: playlistName });
+      } catch (err) {
+        setError(String(err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [buildItems, playlistName, config, persist, target, refreshLicence],
+  );
 
   const stats = useMemo(() => {
     const by = (v: string) => rows.filter((r) => r.verdict === v).length;
     return { total: rows.length, auto: by("auto"), review: by("review"), missing: by("no_match") };
   }, [rows]);
 
-  const readyToPush = rows.filter((r) => selected.has(r.track_id) && chosen[r.track_id]).length;
+  /** The service being pushed to, for labels that used to say "Spotify". */
+  const targetName =
+    connectedTargets.find((p) => p.id === target)?.display_name ?? "your library";
 
   if (bootError) {
     return (
@@ -267,11 +370,36 @@ export default function App() {
   if (!config) return <div className="app"><p className="dim">Loading…</p></div>;
 
   // --- Connect a service --------------------------------------------------
-  if (!account?.configured || !account?.signed_in) {
+  // Forced when *nothing* is connected, not when Spotify specifically is not.
+  // Checking Spotify would strand someone who signed out of it while Apple
+  // Music was working: the app has a usable target, but no way off this screen.
+  const mustConnect = connectedTargets.length === 0;
+
+  if (showServices || mustConnect) {
+    const leaveServices = async () => {
+      setConnecting(null);
+      setShowServices(false);
+      await refreshAccount();
+      void refreshLicence();
+    };
+
     return (
       <div className="app">
-        <h1>DJ Library Sync</h1>
-        <p className="dim intro">Pick where your new downloads should end up.</p>
+        <header className="services-head">
+          <div>
+            <h1>Services</h1>
+            <p className="dim intro">
+              {mustConnect
+                ? "Pick where your new downloads should end up."
+                : "Connect another service, or change how one is set up."}
+            </p>
+          </div>
+          {!mustConnect && (
+            <button className="ghost" onClick={leaveServices}>
+              Done
+            </button>
+          )}
+        </header>
 
         {error && <div className="banner error">{error}</div>}
 
@@ -289,16 +417,19 @@ export default function App() {
                       : "One-click sign in"}
                   </p>
                 </div>
-                {p.connected ? (
-                  <span className="pill good">connected</span>
-                ) : p.available ? (
-                  <button
-                    onClick={() =>
-                      setConnecting(connecting === p.id ? null : p.id)
-                    }
-                  >
-                    {connecting === p.id ? "Close" : "Connect"}
-                  </button>
+                {p.available ? (
+                  <div className="service-actions">
+                    {p.connected && <span className="pill good">connected</span>}
+                    {/* Connected is not the end of the story: a client ID can
+                        be wrong, an account can be the wrong one. Always leave
+                        a way back into the setup. */}
+                    <button
+                      className={p.connected ? "ghost" : ""}
+                      onClick={() => setConnecting(connecting === p.id ? null : p.id)}
+                    >
+                      {connecting === p.id ? "Close" : p.connected ? "Manage" : "Connect"}
+                    </button>
+                  </div>
                 ) : (
                   <span className="pill">{p.metered ? "paid" : "free"}</span>
                 )}
@@ -340,6 +471,30 @@ export default function App() {
                       {account?.configured ? "Sign in" : "Save"}
                     </button>
                   </div>
+
+                  {p.connected && (
+                    <div className="row">
+                      <button
+                        className="ghost"
+                        onClick={async () => {
+                          setBusy("Signing out…");
+                          try {
+                            await invoke("spotify_logout");
+                            await refreshAccount();
+                          } catch (err) {
+                            setError(String(err));
+                          } finally {
+                            setBusy(null);
+                          }
+                        }}
+                      >
+                        Sign out of Spotify
+                      </button>
+                      <span className="dim small">
+                        Leaves your Client ID in place; only the account changes.
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -443,6 +598,10 @@ export default function App() {
     );
   }
 
+  // The services gate no longer implies a loaded account, so say so once here
+  // rather than defending against null at every use below.
+  if (!account) return <div className="app"><p className="dim">Loading…</p></div>;
+
   return (
     <div className="app">
       <header>
@@ -451,11 +610,39 @@ export default function App() {
           <p className="folder">{config.watch_folder ?? "No folder selected"}</p>
         </div>
         <div className="actions">
-          {account.signed_in ? (
-            <span className="who">{account.display_name ?? account.user_id}</span>
-          ) : (
-            <button onClick={signIn}>Connect Spotify</button>
+          {connectedTargets.length > 1 && (
+            <select
+              value={target}
+              onChange={(e) => {
+                setTarget(e.target.value);
+                // Matches, choices and playlists are all per-platform, so
+                // everything on screen belongs to the old one. `chosen` and
+                // `selected` are keyed by local track id, so leaving them
+                // behind means carrying one service's URIs into another.
+                setRows([]);
+                setSelected(new Set());
+                setChosen({});
+                setPlaylists([]);
+                setResult(null);
+              }}
+              aria-label="Sync to"
+            >
+              {connectedTargets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.display_name}
+                </option>
+              ))}
+            </select>
           )}
+          {target === "apple_music" && licence && !licence.unlimited && (
+            <span className="pill">{licence.credits ?? 0} left</span>
+          )}
+          {account.signed_in && (
+            <span className="who">{account.display_name ?? account.user_id}</span>
+          )}
+          <button className="ghost" onClick={() => setShowServices(true)}>
+            Services
+          </button>
           <button className="ghost" onClick={chooseFolder}>
             {config.watch_folder ? "Change folder" : "Choose folder"}
           </button>
@@ -474,12 +661,20 @@ export default function App() {
         </div>
       )}
       {error && <div className="banner error">{error}</div>}
+      {searchFailures > 0 && (
+        <div className="banner error">
+          {searchFailures} of {rows.length} searches failed, so those rows say nothing
+          about whether the tracks exist on {targetName}.
+          Nothing was saved for them — fix the cause and run it again.
+        </div>
+      )}
       {result && (
         <div className="banner good">
           Added {result.added} to “{result.playlist_name}”
           {result.skipped > 0 && ` · ${result.skipped} already there`}
         </div>
       )}
+      {result?.warning && <div className="banner warn">{result.warning}</div>}
 
       {account.signed_in && config.watch_folder && (
         <>
@@ -501,7 +696,7 @@ export default function App() {
                 checked={config.accept_shorter}
                 onChange={(e) => persist({ ...config, accept_shorter: e.target.checked })}
               />
-              Accept the shorter cut when the extended mix isn’t on Spotify
+              Accept the shorter cut when the extended mix isn’t available
             </label>
           </div>
         </>
@@ -509,36 +704,6 @@ export default function App() {
 
       {rows.length > 0 && (
         <>
-          <table>
-            <thead>
-              <tr>
-                <th className="tick"></th>
-                <th>Track</th>
-                <th>Version</th>
-                <th>Match on Spotify</th>
-                <th className="num">Conf.</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <RowView
-                  key={row.track_id}
-                  row={row}
-                  checked={selected.has(row.track_id)}
-                  chosenUri={chosen[row.track_id]}
-                  onToggle={() =>
-                    setSelected((prev) => {
-                      const next = new Set(prev);
-                      next.has(row.track_id) ? next.delete(row.track_id) : next.add(row.track_id);
-                      return next;
-                    })
-                  }
-                  onChoose={(uri) => setChosen((prev) => ({ ...prev, [row.track_id]: uri }))}
-                />
-              ))}
-            </tbody>
-          </table>
-
           <div className="pushbar">
             <input
               list="playlists"
@@ -552,10 +717,111 @@ export default function App() {
                 <option key={p.id} value={p.name} />
               ))}
             </datalist>
-            <button onClick={push} disabled={!!busy || readyToPush === 0 || !playlistName.trim()}>
-              Add {readyToPush} to playlist
-            </button>
+            <span className="dim small">{targetName}</span>
           </div>
+
+          {SECTIONS.map((section) => {
+            const sectionRows = rows.filter((r) => r.verdict === section.verdict);
+            if (sectionRows.length === 0) return null;
+
+            const open = openSections.has(section.verdict);
+            const ready = buildItems(sectionRows).length;
+            // Only rows with a resolvable choice can be selected usefully.
+            const selectable = sectionRows.filter(
+              (r) => r.candidates.length > 0 || r.stored,
+            );
+            const allSelected =
+              selectable.length > 0 && selectable.every((r) => selected.has(r.track_id));
+
+            return (
+              <section key={section.verdict} className={`group ${section.verdict}`}>
+                <header className="group-head">
+                  <button
+                    className="group-toggle"
+                    aria-expanded={open}
+                    onClick={() =>
+                      setOpenSections((prev) => {
+                        const next = new Set(prev);
+                        next.has(section.verdict)
+                          ? next.delete(section.verdict)
+                          : next.add(section.verdict);
+                        return next;
+                      })
+                    }
+                  >
+                    <span className="chevron" aria-hidden="true">
+                      {open ? "▾" : "▸"}
+                    </span>
+                    <span className="group-title">{section.title}</span>
+                    <span className="pill">{sectionRows.length}</span>
+                  </button>
+
+                  <div className="group-actions">
+                    {selectable.length > 0 && (
+                      <button
+                        className="ghost"
+                        onClick={() =>
+                          setSelected((prev) => {
+                            const next = new Set(prev);
+                            for (const r of selectable) {
+                              allSelected ? next.delete(r.track_id) : next.add(r.track_id);
+                            }
+                            return next;
+                          })
+                        }
+                      >
+                        {allSelected ? "Deselect all" : "Select all"}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => push(sectionRows)}
+                      disabled={!!busy || ready === 0 || !playlistName.trim()}
+                    >
+                      Add {ready}
+                    </button>
+                  </div>
+                </header>
+
+                <p className="group-hint dim small">{section.hint}</p>
+
+                {open && (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th className="tick"></th>
+                        <th>Track</th>
+                        <th>Version</th>
+                        <th>Match</th>
+                        <th className="num">Conf.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sectionRows.map((row) => (
+                        <RowView
+                          key={row.track_id}
+                          row={row}
+                          checked={selected.has(row.track_id)}
+                          chosenUri={chosen[row.track_id]}
+                          onToggle={() =>
+                            setSelected((prev) => {
+                              const next = new Set(prev);
+                              next.has(row.track_id)
+                                ? next.delete(row.track_id)
+                                : next.add(row.track_id);
+                              return next;
+                            })
+                          }
+                          onChoose={(uri) =>
+                            setChosen((prev) => ({ ...prev, [row.track_id]: uri }))
+                          }
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </section>
+            );
+          })}
         </>
       )}
     </div>
@@ -605,7 +871,13 @@ function RowView({
               </div>
             </>
           ) : (
-            <span className="dim">{row.cached ? "cached — re-check to see options" : row.reason}</span>
+            <span className={row.error ? "warn" : "dim"}>
+              {row.error
+                ? `Search failed — ${row.error}`
+                : row.cached
+                ? "cached — re-check to see options"
+                : row.reason}
+            </span>
           )}
           {alternatives && (
             <button className="link" onClick={() => setExpanded((v) => !v)}>

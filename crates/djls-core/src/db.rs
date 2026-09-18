@@ -20,6 +20,9 @@ use crate::matcher::{MatchOutcome, Verdict};
 use crate::tags::LocalTrack;
 
 pub const PLATFORM_SPOTIFY: &str = "spotify";
+/// Matches are keyed per platform, so the same local file can hold a Spotify
+/// match and an Apple Music one without either overwriting the other.
+pub const PLATFORM_APPLE_MUSIC: &str = "apple_music";
 
 fn now() -> i64 {
     SystemTime::now()

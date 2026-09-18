@@ -8,14 +8,20 @@ use std::sync::Mutex;
 
 use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
 use djls_core::config::Config;
-use djls_core::db::{Database, PLATFORM_SPOTIFY};
+use djls_core::apple::{AppleClient, DeveloperTokenSource};
+use djls_core::db::{Database, PLATFORM_APPLE_MUSIC, PLATFORM_SPOTIFY};
 use djls_core::licence;
 use djls_core::matcher::{evaluate, Candidate, MatchOutcome, ShorterVersionPolicy, Thresholds};
+use djls_core::platform::MusicPlatform;
 use djls_core::spotify::SpotifyClient;
 use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, FolderWatcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+
+/// Give up once this many searches have been attempted and most have failed.
+const MIN_ATTEMPTS_BEFORE_ABORT: usize = 5;
+const ABORT_ERROR_RATE: f64 = 0.5;
 
 /// Candidates per search query; Spotify caps development-mode apps at 10.
 const SEARCH_LIMIT: u32 = 10;
@@ -167,6 +173,64 @@ fn auth_config() -> Result<AuthConfig, String> {
 fn user_client() -> Result<SpotifyClient, String> {
     SpotifyClient::for_user(auth_config()?, Box::new(KeyringStore::default()))
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Build a client for whichever platform the user is syncing to.
+///
+/// Everything above this — scanning, scoring, the database, the push guards —
+/// is platform-agnostic, so the sync path takes a trait object and never asks
+/// which service it is talking to.
+async fn platform_client(platform: &str) -> Result<Box<dyn MusicPlatform>, String> {
+    match platform {
+        PLATFORM_SPOTIFY => Ok(Box::new(user_client()?)),
+        PLATFORM_APPLE_MUSIC => {
+            let stored = current_licence()
+                .await?
+                .ok_or_else(|| "Start a trial or enter a licence key first.".to_string())?;
+
+            let user_token = licence::AppleTokenKeyring::default()
+                .load()
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| {
+                    "Apple Music is not connected on this machine. Connect it from                      the Services screen."
+                        .to_string()
+                })?;
+
+            let client = AppleClient::new(
+                DeveloperTokenSource::Hosted {
+                    service_url: licence::service_url(),
+                    activation_token: stored.token,
+                },
+                Some(user_token),
+            )
+            .map_err(|e| format!("{e:#}"))?;
+
+            Ok(Box::new(client))
+        }
+        other => Err(format!("Unknown platform: {other}")),
+    }
+}
+
+/// Tell the service how many tracks were pushed.
+///
+/// Best-effort and deliberately non-fatal: the tracks are already in the
+/// playlist, and a billing failure must never be reported to the user as a
+/// failed push. Spotify is not metered at all, so it never gets here.
+async fn report_usage(platform: &str, tracks: usize) {
+    if platform != PLATFORM_APPLE_MUSIC || tracks == 0 {
+        return;
+    }
+
+    let Ok(Some(stored)) = current_licence().await else {
+        return;
+    };
+    let Ok(client) = licence::ServiceClient::new(licence::service_url()) else {
+        return;
+    };
+
+    if let Err(err) = client.report_usage(&stored.token, tracks as u32).await {
+        eprintln!("[licence] usage not reported ({tracks} tracks): {err:#}");
+    }
 }
 
 #[tauri::command]
@@ -495,8 +559,26 @@ struct MatchRow {
     confidence: f32,
     reason: String,
     candidates: Vec<Candidate>,
+    /// The match already stored for this track, present only on a cached row.
+    ///
+    /// Candidates are not persisted, so without this a cached row carried no
+    /// identifier at all and could not be pushed — which made every run after
+    /// the first look like it had nothing to do.
+    stored: Option<StoredChoice>,
+    /// Set when the search itself failed, as opposed to finding nothing. The
+    /// difference matters: one is worth retrying, the other is not.
+    error: Option<String>,
     /// True when this came from the local database rather than a fresh query.
     cached: bool,
+}
+
+/// Enough of a stored match to push it again without re-querying.
+#[derive(Serialize, Clone)]
+struct StoredChoice {
+    uri: String,
+    name: String,
+    artists: String,
+    duration_ms: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -509,11 +591,12 @@ struct MatchProgress {
 async fn match_folder(
     app: AppHandle,
     path: String,
+    platform: String,
     accept_shorter: bool,
     rescan: bool,
 ) -> Result<Vec<MatchRow>, String> {
     let folder = ensure_folder(&path)?;
-    let client = user_client()?;
+    let client = platform_client(&platform).await?;
     let db = Database::open(&Database::default_path()).map_err(|e| format!("{e:#}"))?;
 
     let thresholds = Thresholds {
@@ -528,6 +611,7 @@ async fn match_folder(
     let (tracks, _failures) = scan_folder(&folder, true);
     let total = tracks.len();
     let mut rows = Vec::with_capacity(total);
+    let mut failed = 0usize;
 
     for (index, track) in tracks.into_iter().enumerate() {
         let _ = app.emit("match-progress", MatchProgress { done: index, total });
@@ -535,7 +619,16 @@ async fn match_folder(
         let record = db.upsert_track(&track).map_err(|e| format!("{e:#}"))?;
 
         if !rescan && record.can_reuse_match() {
-            if let Ok(Some(stored)) = db.stored_match(record.id, PLATFORM_SPOTIFY) {
+            if let Ok(Some(stored)) = db.stored_match(record.id, &platform) {
+                // No alternatives — those need a re-check — but the match
+                // itself is enough to push again.
+                let choice = stored.platform_uri.clone().map(|uri| StoredChoice {
+                    uri,
+                    name: stored.platform_name.clone().unwrap_or_default(),
+                    artists: stored.platform_artists.clone().unwrap_or_default(),
+                    duration_ms: stored.platform_duration_ms.unwrap_or(0),
+                });
+
                 rows.push(MatchRow {
                     track_id: record.id,
                     track,
@@ -543,30 +636,71 @@ async fn match_folder(
                     method: stored.method,
                     confidence: stored.confidence,
                     reason: stored.reason,
-                    // Candidates are not persisted, so a cached row cannot
-                    // offer alternatives; re-scan to get them back.
                     candidates: Vec::new(),
+                    stored: choice,
+                    error: None,
                     cached: true,
                 });
                 continue;
             }
         }
 
+        // A failed search is not the same thing as a track that is not on the
+        // platform. `unwrap_or_default()` conflated them, which turned an
+        // outage into a confident 0% match rate — and then cached it.
+        let mut search_error = None;
+
         let isrc_hits = match &track.isrc {
-            Some(isrc) => client.search_isrc(isrc).await.unwrap_or_default(),
+            Some(isrc) => match client.search_isrc(isrc).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
-        let text_hits = if isrc_hits.is_empty() {
-            client
-                .search_for_track(&track, SEARCH_LIMIT)
-                .await
-                .unwrap_or_default()
+
+        let text_hits = if isrc_hits.is_empty() && search_error.is_none() {
+            match client.search_for_track(&track, SEARCH_LIMIT).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    search_error = Some(format!("{err:#}"));
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
 
+        if let Some(message) = &search_error {
+            failed += 1;
+
+            // Stop early rather than grinding through hundreds of tracks to
+            // produce a match rate that means nothing.
+            let attempts = index + 1;
+            if attempts >= MIN_ATTEMPTS_BEFORE_ABORT
+                && (failed as f64 / attempts as f64) >= ABORT_ERROR_RATE
+            {
+                return Err(format!(
+                    "Stopped: {failed} of the first {attempts} searches failed, so any                      match rate would be meaningless. The last error was:\n{message}"
+                ));
+            }
+        }
+
         let outcome: MatchOutcome = evaluate(&track, &isrc_hits, &text_hits, thresholds);
-        let _ = db.record_match(record.id, PLATFORM_SPOTIFY, &outcome);
+
+        // Only cache a real answer. Recording a failed search as "no match"
+        // makes the failure permanent: the next run serves it from the cache
+        // and never retries.
+        if search_error.is_none() {
+            if let Err(err) = db.record_match(record.id, &platform, &outcome) {
+                // Not fatal — the match is still returned to the UI — but a
+                // silent failure here means the next run has no memory of
+                // this one, and nothing would ever say why.
+                eprintln!("[db] could not record the {platform} match: {err:#}");
+            }
+        }
 
         rows.push(MatchRow {
             track_id: record.id,
@@ -576,6 +710,8 @@ async fn match_folder(
             confidence: outcome.confidence(),
             reason: outcome.reason.clone(),
             candidates: outcome.candidates,
+            stored: None,
+            error: search_error,
             cached: false,
         });
     }
@@ -597,8 +733,8 @@ struct PlaylistInfo {
 }
 
 #[tauri::command]
-async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
-    let client = user_client()?;
+async fn list_playlists(platform: String) -> Result<Vec<PlaylistInfo>, String> {
+    let client = platform_client(&platform).await?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
     let playlists = client
         .list_playlists()
@@ -607,7 +743,9 @@ async fn list_playlists() -> Result<Vec<PlaylistInfo>, String> {
 
     Ok(playlists
         .into_iter()
-        .filter(|p| p.is_owned_by(&me.id))
+        // Offer what can actually be written to. Apple reports no owner, and
+        // filtering on ownership would leave the list empty.
+        .filter(|p| p.is_writable_by(&me.id))
         .map(|p| PlaylistInfo {
             track_count: p.track_count(),
             owned: true,
@@ -637,11 +775,46 @@ struct PushResult {
     playlist_name: String,
     added: usize,
     skipped: usize,
+    /// Set when a guard could not run. The push still happened; it was just
+    /// protected by fewer checks than usual, and that is worth saying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+/// Whether an identifier plausibly belongs to `platform`.
+///
+/// Spotify URIs are `spotify:track:<id>`; Apple's are bare numeric catalogue
+/// ids. Sending one to the other is not a near miss — Apple answers a Spotify
+/// URI with `500 Unable to update tracks`, which reads like an outage on their
+/// side rather than a mistake on ours.
+fn uri_belongs_to(platform: &str, uri: &str) -> bool {
+    match platform {
+        PLATFORM_SPOTIFY => uri.starts_with("spotify:track:") && uri.len() > "spotify:track:".len(),
+        // `all` is vacuously true on an empty string, so the emptiness check
+        // has to come first or a blank id sails through.
+        PLATFORM_APPLE_MUSIC => !uri.is_empty() && uri.chars().all(|c| c.is_ascii_digit()),
+        _ => true,
+    }
 }
 
 #[tauri::command]
-async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<PushResult, String> {
-    let client = user_client()?;
+async fn push_tracks(
+    playlist_name: String,
+    platform: String,
+    items: Vec<PushItem>,
+) -> Result<PushResult, String> {
+    // Catch a cross-platform push before it leaves the machine. Matches are
+    // stored per platform and the UI clears them when the target changes, so
+    // this should be unreachable — which is exactly why it is worth asserting
+    // rather than trusting.
+    if let Some(wrong) = items.iter().find(|i| !uri_belongs_to(&platform, &i.uri)) {
+        return Err(format!(
+            "These matches are not for {platform}: \"{}\" looks like it came from another              service. Re-match this folder with {platform} selected before pushing.",
+            wrong.uri
+        ));
+    }
+
+    let client = platform_client(&platform).await?;
     let db = Database::open(&Database::default_path()).map_err(|e| format!("{e:#}"))?;
     let me = client.current_user().await.map_err(|e| format!("{e:#}"))?;
 
@@ -650,10 +823,27 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
         .await
         .map_err(|e| format!("{e:#}"))?
         .into_iter()
-        .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_owned_by(&me.id));
+        // Writable, not owned: Apple's library playlists carry no owner, and
+        // reading that as "not mine" would create a duplicate every run.
+        .find(|p| p.name.eq_ignore_ascii_case(&playlist_name) && p.is_writable_by(&me.id));
 
+    // Reading the playlist is one of three duplicate guards, and the only one
+    // that works on a machine whose local log is empty — a reinstall, or a
+    // cleared database. Failing to read it silently left the push looking
+    // fully protected when it was not.
+    let mut warning = None;
     let already = match &existing {
-        Some(p) => client.playlist_entries(&p.id).await.unwrap_or_default(),
+        Some(p) => match client.playlist_entries(&p.id).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("[push] could not read \"{}\": {err:#}", p.name);
+                warning = Some(format!(
+                    "Could not read what is already in \"{}\", so duplicates were only                      checked against this machine's own history. If this playlist was                      filled from another device, some tracks may be added twice.",
+                    p.name
+                ));
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
 
@@ -672,7 +862,7 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
 
     for item in items {
         let logged = db
-            .already_synced(item.track_id, &playlist.id, PLATFORM_SPOTIFY)
+            .already_synced(item.track_id, &playlist.id, &platform)
             .unwrap_or(false);
         let dupe = to_add.iter().any(|(_, uri)| uri == &item.uri);
 
@@ -697,19 +887,29 @@ async fn push_tracks(playlist_name: String, items: Vec<PushItem>) -> Result<Push
 
     let uris: Vec<String> = to_add.iter().map(|(_, uri)| uri.clone()).collect();
     let added = client
-        .add_tracks_to_playlist(&playlist.id, &uris)
+        .add_tracks(&playlist.id, &uris)
         .await
         .map_err(|e| format!("{e:#}"))?;
 
     // Logged only after the write lands, so a failure is retried not swallowed.
     for (track_id, uri) in &to_add {
-        let _ = db.record_sync(*track_id, PLATFORM_SPOTIFY, uri, &playlist.id);
+        if let Err(err) = db.record_sync(*track_id, &platform, uri, &playlist.id) {
+            // The track is in the playlist either way; losing the log only
+            // risks offering it again next time, which the playlist contents
+            // check would then catch.
+            eprintln!("[db] could not log the {platform} push of {uri}: {err:#}");
+        }
     }
+
+    // After the log, for the same reason: billing must never be the thing that
+    // makes a successful push look like a failure.
+    report_usage(&platform, added).await;
 
     Ok(PushResult {
         playlist_name: playlist.name,
         added,
         skipped,
+        warning,
     })
 }
 
@@ -741,4 +941,45 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJ Library Sync");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spotify_uri_is_never_pushed_to_apple() {
+        // Apple answers a Spotify URI with "500 Unable to update tracks",
+        // which reads like an outage rather than a mistake on our side.
+        assert!(!uri_belongs_to(
+            PLATFORM_APPLE_MUSIC,
+            "spotify:track:6I9VzXrHxO9rA9A5euc8Ak"
+        ));
+        assert!(uri_belongs_to(PLATFORM_APPLE_MUSIC, "1440857781"));
+    }
+
+    #[test]
+    fn an_apple_id_is_never_pushed_to_spotify() {
+        assert!(!uri_belongs_to(PLATFORM_SPOTIFY, "1440857781"));
+        assert!(uri_belongs_to(
+            PLATFORM_SPOTIFY,
+            "spotify:track:6I9VzXrHxO9rA9A5euc8Ak"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_platform_is_not_second_guessed() {
+        // A new adapter should not be blocked by a guard that has never heard
+        // of its identifier format.
+        assert!(uri_belongs_to("tidal", "anything-at-all"));
+    }
+
+    #[test]
+    fn apple_ids_are_digits_only() {
+        // Library ids (i.xxx) and playlist ids (p.xxx) cannot be added as
+        // catalogue songs, so they must not pass either.
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, "i.abc123"));
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, "p.xyz789"));
+        assert!(!uri_belongs_to(PLATFORM_APPLE_MUSIC, ""));
+    }
 }
