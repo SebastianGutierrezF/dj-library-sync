@@ -219,7 +219,7 @@ export default function App() {
 
   const chooseFolder = useCallback(async () => {
     if (!config) return;
-    const picked = await open({ directory: true, multiple: false, title: "Pick your downloads folder" });
+    const picked = await open({ directory: true, multiple: false, title: "Pick your music folder" });
     if (typeof picked !== "string") return;
     await persist({ ...config, watch_folder: picked });
     await invoke("start_watching", { path: picked }).catch(() => undefined);
