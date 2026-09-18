@@ -14,9 +14,15 @@ import type {
   PlatformOption,
   PlaylistInfo,
   PushResult,
+  UpdateStatus,
 } from "./types";
 
 const DERIVATIVE: MixKind[] = ["Remix", "Rework", "Edit", "Vip"];
+
+/** Which version's update banner has been waved away. Per-version, so
+ *  dismissing 0.1.5 does not also hide 0.1.6 — "not now" is about this
+ *  release, not about ever being told again. */
+const DISMISSED_UPDATE = "djls.dismissedUpdate";
 
 const SECTIONS = [
   {
@@ -148,6 +154,17 @@ export default function App() {
 
   const [bootError, setBootError] = useState<string | null>(null);
 
+  // A newer build, when there is one. Checked once at startup: releases are
+  // not frequent enough to be worth polling, and nothing here blocks on it.
+  const [update, setUpdate] = useState<UpdateStatus | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(DISMISSED_UPDATE);
+    } catch {
+      return null;
+    }
+  });
+
   useEffect(() => {
     (async () => {
       try {
@@ -164,6 +181,9 @@ export default function App() {
         // failure path: the token service being unreachable must not stop the
         // free Spotify tier from starting.
         void refreshLicence();
+        // Same reasoning: never on the path that can set bootError. Being
+        // unable to ask about releases is not a reason to refuse to start.
+        void invoke<UpdateStatus>("check_for_update").then(setUpdate, () => {});
       } catch (err) {
         // Without this the window sits on "Loading…" forever with no clue why.
         setBootError(String(err));
@@ -648,6 +668,45 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {update?.updateAvailable && update.latest !== updateDismissed && (
+        <div className="banner update">
+          <span>
+            Version {update.latest} is out
+            <span className="dim small"> — you have {update.current}</span>
+          </span>
+          <span className="update-actions">
+            <button
+              onClick={async () => {
+                try {
+                  await invoke("open_download");
+                } catch (url) {
+                  // open_download hands back the address when it could not
+                  // launch a browser, so there is still a way through.
+                  setError(`Could not open the browser. Download it from ${url}`);
+                }
+              }}
+            >
+              Get it
+            </button>
+            <button
+              className="ghost"
+              onClick={() => {
+                const version = update.latest;
+                setUpdateDismissed(version);
+                try {
+                  if (version) localStorage.setItem(DISMISSED_UPDATE, version);
+                } catch {
+                  // A browser that will not remember the dismissal just means
+                  // the banner returns next launch. Not worth saying anything.
+                }
+              }}
+            >
+              Not now
+            </button>
+          </span>
+        </div>
+      )}
 
       {busy && <div className="banner">{busy}{progress ? ` ${progress.done}/${progress.total}` : ""}</div>}
 

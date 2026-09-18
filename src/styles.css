@@ -317,3 +317,15 @@ button.link {
    without repeating the fill. */
 .group.auto .group-title { color: var(--accent); }
 .group.no_match .group-title { color: var(--dim); }
+
+/* The update banner. Shaped like .arrivals — a statement on the left, the
+   actions on the right — because it is the same kind of thing: something
+   happened that you may want to act on, and may equally want to ignore. */
+.banner.update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.update-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.banner.update button { padding: 5px 12px; font-size: 12px; }

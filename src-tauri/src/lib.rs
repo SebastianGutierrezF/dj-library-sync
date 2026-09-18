@@ -14,6 +14,7 @@ use djls_core::licence;
 use djls_core::matcher::{evaluate, Candidate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::platform::MusicPlatform;
 use djls_core::spotify::SpotifyClient;
+use djls_core::update::{self, UpdateStatus};
 use djls_core::tags::{scan_folder, LocalTrack};
 use djls_core::watcher::{watch_folder, FolderWatcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
@@ -913,6 +914,56 @@ async fn push_tracks(
     })
 }
 
+/// Whether a newer build exists.
+///
+/// Answers rather than errors: a failed check is not worth interrupting anyone
+/// over, and there is nothing they could do about it. The UI shows a banner
+/// when `updateAvailable` is true and nothing at all otherwise, so a service
+/// that is down simply means no banner.
+///
+/// The version comes from the crate rather than being passed in, so it can
+/// only ever be this build's.
+#[tauri::command]
+async fn check_for_update() -> UpdateStatus {
+    let current = env!("CARGO_PKG_VERSION");
+
+    match update::check(&licence::service_url(), current).await {
+        Ok(status) => status,
+        Err(err) => {
+            // Logged, not surfaced. Worth having in the console when someone
+            // asks why they were never told about a release.
+            eprintln!("[update] check failed: {err:#}");
+            UpdateStatus {
+                current: current.to_string(),
+                latest: None,
+                update_available: false,
+                download_url: format!(
+                    "{}/download",
+                    licence::service_url().trim_end_matches('/')
+                ),
+            }
+        }
+    }
+}
+
+/// Open the download page in the user's browser.
+///
+/// Takes no URL. The frontend asking to open an arbitrary address would make
+/// this a way to launch anything the web view could be persuaded to name; the
+/// only destination that makes sense is the one this build already talks to.
+#[tauri::command]
+async fn open_download() -> Result<(), String> {
+    let url = format!("{}/download", licence::service_url().trim_end_matches('/'));
+
+    if auth::open_in_browser(&url) {
+        Ok(())
+    } else {
+        // The banner shows the address when this fails, so the user is not
+        // stuck — they can type it.
+        Err(url)
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -937,7 +988,9 @@ pub fn run() {
             activate_licence,
             clear_licence,
             apple_login,
-            apple_logout
+            apple_logout,
+            check_for_update,
+            open_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJ Library Sync");

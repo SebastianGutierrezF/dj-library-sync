@@ -155,3 +155,15 @@ export interface StoredChoice {
   artists: string;
   duration_ms: number;
 }
+
+/** Whether a newer build exists. Never an error: a failed check reports no
+ *  update rather than interrupting anyone. */
+export interface UpdateStatus {
+  /** This build. */
+  current: string;
+  /** The newest published release, or null when there is nothing to compare
+   *  against — no release, a pre-release, or a version neither side can read. */
+  latest: string | null;
+  updateAvailable: boolean;
+  downloadUrl: string;
+}
