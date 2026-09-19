@@ -1000,6 +1000,37 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// The version lives in three files and nothing made them agree.
+    ///
+    /// `CARGO_PKG_VERSION` is what the update banner compares against, and
+    /// `tauri.conf.json` is what the installer is stamped with. If those two
+    /// drift, everyone who installs the release is told there is a newer
+    /// version available — the one they just installed — which is the most
+    /// effective way imaginable to teach people the banner is noise.
+    ///
+    /// `package.json` is not read by Tauri and only misleads a human, but it
+    /// costs one line to keep honest.
+    #[test]
+    fn every_file_agrees_on_the_version() {
+        let crate_version = env!("CARGO_PKG_VERSION");
+
+        let tauri_conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        assert_eq!(
+            tauri_conf["version"].as_str(),
+            Some(crate_version),
+            "tauri.conf.json disagrees with Cargo.toml"
+        );
+
+        let package: serde_json::Value =
+            serde_json::from_str(include_str!("../../package.json")).expect("package.json");
+        assert_eq!(
+            package["version"].as_str(),
+            Some(crate_version),
+            "package.json disagrees with Cargo.toml"
+        );
+    }
+
     #[test]
     fn a_spotify_uri_is_never_pushed_to_apple() {
         // Apple answers a Spotify URI with "500 Unable to update tracks",
