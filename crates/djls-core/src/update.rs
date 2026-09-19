@@ -59,10 +59,7 @@ fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
 
     // Drop a pre-release or build suffix before splitting: `0.1.5-rc.1` orders
     // as 0.1.5 for this purpose, and pre-releases are filtered out anyway.
-    let core = without_v
-        .split(['-', '+'])
-        .next()
-        .unwrap_or(without_v);
+    let core = without_v.split(['-', '+']).next().unwrap_or(without_v);
 
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -173,8 +170,14 @@ mod tests {
 
     #[test]
     fn a_suffix_orders_by_its_numbers() {
-        assert_eq!(compare_versions("0.1.4", "0.1.5-rc.1"), Some(Ordering::Less));
-        assert_eq!(compare_versions("0.1.5+build7", "0.1.5"), Some(Ordering::Equal));
+        assert_eq!(
+            compare_versions("0.1.4", "0.1.5-rc.1"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.1.5+build7", "0.1.5"),
+            Some(Ordering::Equal)
+        );
     }
 
     #[test]
@@ -188,12 +191,19 @@ mod tests {
                 None,
                 "{tag:?} should not compare"
             );
-            assert_eq!(compare_versions(tag, "0.1.4"), None, "{tag:?} should not compare");
+            assert_eq!(
+                compare_versions(tag, "0.1.4"),
+                None,
+                "{tag:?} should not compare"
+            );
         }
     }
 
     #[test]
     fn whitespace_does_not_change_the_answer() {
-        assert_eq!(compare_versions(" 0.1.4 ", "\tv0.1.4\n"), Some(Ordering::Equal));
+        assert_eq!(
+            compare_versions(" 0.1.4 ", "\tv0.1.4\n"),
+            Some(Ordering::Equal)
+        );
     }
 }

@@ -854,10 +854,9 @@ mod tests {
     fn a_followed_playlist_is_not_writable() {
         // Spotify lists playlists the user merely follows; writing to one
         // fails, so there the owner still has to match.
-        let followed: Playlist = serde_json::from_str(
-            r#"{"id":"1","name":"Someone else's","owner":{"id":"them"}}"#,
-        )
-        .unwrap();
+        let followed: Playlist =
+            serde_json::from_str(r#"{"id":"1","name":"Someone else's","owner":{"id":"them"}}"#)
+                .unwrap();
         assert!(!followed.is_writable_by("me"));
 
         let mine: Playlist =

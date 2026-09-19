@@ -6,16 +6,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use djls_core::apple::{AppleClient, DeveloperTokenSource};
 use djls_core::auth::{self, AuthConfig, KeyringStore, TokenStore};
 use djls_core::config::Config;
-use djls_core::apple::{AppleClient, DeveloperTokenSource};
 use djls_core::db::{Database, PLATFORM_APPLE_MUSIC, PLATFORM_SPOTIFY};
 use djls_core::licence;
 use djls_core::matcher::{evaluate, Candidate, MatchOutcome, ShorterVersionPolicy, Thresholds};
 use djls_core::platform::MusicPlatform;
 use djls_core::spotify::SpotifyClient;
-use djls_core::update::{self, UpdateStatus};
 use djls_core::tags::{scan_folder, LocalTrack};
+use djls_core::update::{self, UpdateStatus};
 use djls_core::watcher::{watch_folder, FolderWatcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -937,10 +937,7 @@ async fn check_for_update() -> UpdateStatus {
                 current: current.to_string(),
                 latest: None,
                 update_available: false,
-                download_url: format!(
-                    "{}/download",
-                    licence::service_url().trim_end_matches('/')
-                ),
+                download_url: format!("{}/download", licence::service_url().trim_end_matches('/')),
             }
         }
     }

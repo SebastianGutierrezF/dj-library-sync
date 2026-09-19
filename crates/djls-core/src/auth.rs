@@ -402,7 +402,9 @@ where
             Ok(_) => {
                 "<h2>Connected.</h2><p>You can close this tab and go back to DJ Library Sync.</p>"
             }
-            Err(_) => "<h2>Something went wrong.</h2><p>Go back to DJ Library Sync for details.</p>",
+            Err(_) => {
+                "<h2>Something went wrong.</h2><p>Go back to DJ Library Sync for details.</p>"
+            }
         };
         let body = format!(
             "<!doctype html><meta charset=utf-8><title>DJ Library Sync</title>\
