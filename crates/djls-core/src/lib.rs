@@ -14,6 +14,7 @@ pub mod normalize;
 pub mod platform;
 pub mod spotify;
 pub mod tags;
+pub mod update;
 pub mod watcher;
 
 pub use auth::{AuthConfig, KeyringStore, TokenStore, Tokens};

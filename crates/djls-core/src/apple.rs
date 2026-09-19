@@ -289,7 +289,11 @@ impl AppleClient {
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str, needs_user: bool) -> Result<T> {
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        needs_user: bool,
+    ) -> Result<T> {
         let body = self
             .request(reqwest::Method::GET, url, None, needs_user)
             .await?;
@@ -349,7 +353,10 @@ impl AppleClient {
     }
 
     /// Walk a paginated `/me` collection to the end.
-    async fn get_all_library<T: serde::de::DeserializeOwned>(&self, first: String) -> Result<Vec<T>> {
+    async fn get_all_library<T: serde::de::DeserializeOwned>(
+        &self,
+        first: String,
+    ) -> Result<Vec<T>> {
         let mut url = Some(first);
         let mut all = Vec::new();
 
@@ -677,7 +684,9 @@ impl MusicPlatform for AppleClient {
         let artist = local.primary_artist();
         let title = &local.parsed.base;
 
-        let mut results = self.search_text(&format!("{artist} {title}"), limit).await?;
+        let mut results = self
+            .search_text(&format!("{artist} {title}"), limit)
+            .await?;
 
         // Same problem Spotify has: a bare "artist title" search ranks the
         // radio edit above the extended mix, so a long-form local file never
@@ -845,7 +854,10 @@ mod tests {
 
         let track = song.into_track();
         assert_eq!(track.id, "1440857781");
-        assert_eq!(track.uri, "1440857781", "the id is what an add request takes");
+        assert_eq!(
+            track.uri, "1440857781",
+            "the id is what an add request takes"
+        );
         assert_eq!(track.name, "Keep Up");
         assert_eq!(track.duration_ms, 241_000);
         assert_eq!(track.isrc.as_deref(), Some("SE5V42200001"));
@@ -912,10 +924,14 @@ mod tests {
         )
         .unwrap();
         let unknown: LibraryPlaylist =
-            serde_json::from_str(r#"{ "id": "p.3", "attributes": { "name": "No flag" } }"#).unwrap();
+            serde_json::from_str(r#"{ "id": "p.3", "attributes": { "name": "No flag" } }"#)
+                .unwrap();
 
         assert!(editable.is_writable());
-        assert!(!catalogue.is_writable(), "adding here would 403 at push time");
+        assert!(
+            !catalogue.is_writable(),
+            "adding here would 403 at push time"
+        );
         assert!(
             unknown.is_writable(),
             "a missing flag must not hide every playlist"

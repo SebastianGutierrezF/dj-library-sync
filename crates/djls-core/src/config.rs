@@ -39,7 +39,8 @@ impl Config {
         }
 
         let mut bytes = [0u8; 16];
-        getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("generating a device id: {e}"))?;
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("generating a device id: {e}"))?;
         let id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
 
         self.device_id = Some(id.clone());
@@ -122,11 +123,18 @@ mod tests {
         let path = dir.join("config.json");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, r#"{"spotify_client_id":"abc","accept_shorter":false}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"spotify_client_id":"abc","accept_shorter":false}"#,
+        )
+        .unwrap();
 
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.spotify_client_id.as_deref(), Some("abc"));
-        assert!(loaded.device_id.is_none(), "an absent id is generated on first use");
+        assert!(
+            loaded.device_id.is_none(),
+            "an absent id is generated on first use"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

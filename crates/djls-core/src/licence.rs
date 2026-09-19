@@ -302,14 +302,17 @@ fn describe_service_error(status: u16, body: &str) -> String {
     let detail = extract_error(body).unwrap_or_else(|| body.trim().to_string());
     match status {
         400 => format!("The service rejected the request: {detail}"),
-        401 => "This licence is no longer valid on this machine. Re-enter it in Settings."
-            .to_string(),
+        401 => {
+            "This licence is no longer valid on this machine. Re-enter it in Settings.".to_string()
+        }
         402 => "This licence has not been paid for yet. If you have just checked out, \
                 give it a few seconds and try again."
             .to_string(),
         403 => "That licence has been cancelled. Resubscribe and the same key will work again."
             .to_string(),
-        404 => "That licence key is not recognised. Check for typos, or paste it again.".to_string(),
+        404 => {
+            "That licence key is not recognised. Check for typos, or paste it again.".to_string()
+        }
         409 => format!(
             "That licence is already active on all of its devices. {detail} \
              Deactivate one before adding this machine."
@@ -588,7 +591,9 @@ mod tests {
 
         // Anything able to reach the loopback port could otherwise hand us a
         // token of its choosing.
-        assert!(parse_apple_callback("/callback?music_user_token=evil&state=other", "xyz").is_err());
+        assert!(
+            parse_apple_callback("/callback?music_user_token=evil&state=other", "xyz").is_err()
+        );
         assert!(parse_apple_callback("/callback?music_user_token=abc", "xyz").is_err());
     }
 
@@ -602,7 +607,10 @@ mod tests {
     fn the_fixture_helper_round_trips() {
         // Guards the tests above: a broken fixture would make them meaningless.
         for ts in [0i64, 946_684_800, 1_789_560_000] {
-            assert_eq!(crate::apple::rfc3339_to_unix(&unix_to_rfc3339(ts)), Some(ts));
+            assert_eq!(
+                crate::apple::rfc3339_to_unix(&unix_to_rfc3339(ts)),
+                Some(ts)
+            );
         }
     }
 }
